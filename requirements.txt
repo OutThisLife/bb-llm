@@ -1,0 +1,19 @@
+# Core ML
+torch
+transformers
+bitsandbytes
+accelerate
+qwen-vl-utils
+
+# Optimization
+cma
+
+# Browser automation
+playwright
+
+# Image processing
+Pillow
+numpy
+
+# Visualization (optional, for --preview)
+matplotlib

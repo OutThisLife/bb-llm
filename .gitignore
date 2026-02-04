@@ -1,0 +1,9 @@
+conda-env/
+__pycache__/
+out_adapter/
+unsloth_compiled_cache/
+
+*.pt
+data.jsonl
+*.log
+art_data/
