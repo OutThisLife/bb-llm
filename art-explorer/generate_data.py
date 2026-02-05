@@ -181,7 +181,7 @@ def make_params(refs, n_layers):
     layers = n_layers if n_layers >= 0 else None
 
     # 30% chance to breed from refs
-    if refs and random.random() < 0.05:
+    if refs and random.random() < 0.3:
         return _breed_from_refs(refs, layers)
 
     return random_params(n_layers=layers)

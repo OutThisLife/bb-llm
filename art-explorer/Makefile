@@ -24,7 +24,7 @@ iterate:
 
 # === Phase 1: Data Generation ===
 generate:
-	$(P) generate_data.py -n $(N)
+	$(P) generate_data.py -n $(N) --clean
 
 generate-preview:
 	$(P) generate_data.py -n $(N) --clean --preview

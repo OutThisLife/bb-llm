@@ -24,6 +24,11 @@ PREFIX_MAP = {
     "Scene.position": "position",
     "Scene.rotation": "rotation",
     "Scene.scale": "scale",
+    # Noise effect
+    "Noise.enabled": "noiseEnabled",
+    "Noise.density": "noiseDensity",
+    "Noise.opacity": "noiseOpacity",
+    "Noise.size": "noiseSize",
 }
 
 # Reverse: flat key → prefixed key

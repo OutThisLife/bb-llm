@@ -69,15 +69,19 @@ class ParamsDataset(Dataset):
         # Layer targets
         layers = params.get("layers", [])
         layer_count = min(len(layers), MAX_LAYERS)
-        
+
         # Normalize each layer (pad to MAX_LAYERS)
         layer_targets = []
         for i in range(MAX_LAYERS):
             if i < len(layers):
-                layer_targets.append(torch.tensor(normalize_layer(layers[i]), dtype=torch.float32))
+                layer_targets.append(
+                    torch.tensor(normalize_layer(layers[i]), dtype=torch.float32)
+                )
             else:
                 # Default layer (zeros after normalization would be mid-range)
-                layer_targets.append(torch.tensor([0.5] * len(LAYER_CONTINUOUS), dtype=torch.float32))
+                layer_targets.append(
+                    torch.tensor([0.5] * len(LAYER_CONTINUOUS), dtype=torch.float32)
+                )
 
         return img, cont, cat, bools, layer_count, layer_targets
 
@@ -155,7 +159,14 @@ def train(
         cat_total = 0
 
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}")
-        for imgs, cont_targets, cat_targets, bool_targets, layer_count_targets, layer_targets in pbar:
+        for (
+            imgs,
+            cont_targets,
+            cat_targets,
+            bool_targets,
+            layer_count_targets,
+            layer_targets,
+        ) in pbar:
             imgs = imgs.to(device)
             cont_targets = cont_targets.to(device)
             bool_targets = bool_targets.to(device)
@@ -176,8 +187,12 @@ def train(
             loss += bool_weight * F.binary_cross_entropy(bool_pred, bool_targets)
 
             # CrossEntropy for layer count
-            loss += layer_count_weight * F.cross_entropy(layer_count_pred, layer_count_targets)
-            layer_count_correct += (layer_count_pred.argmax(1) == layer_count_targets).sum().item()
+            loss += layer_count_weight * F.cross_entropy(
+                layer_count_pred, layer_count_targets
+            )
+            layer_count_correct += (
+                (layer_count_pred.argmax(1) == layer_count_targets).sum().item()
+            )
 
             # MSE for layer params (only for layers that exist)
             for i in range(MAX_LAYERS):
@@ -186,7 +201,9 @@ def train(
                 # Mask: only compute loss for samples where this layer exists
                 mask = (layer_count_targets > i).float().unsqueeze(1)
                 if mask.sum() > 0:
-                    layer_loss = ((layer_pred - layer_target) ** 2 * mask).sum() / mask.sum()
+                    layer_loss = (
+                        (layer_pred - layer_target) ** 2 * mask
+                    ).sum() / mask.sum()
                     loss += layer_weight * layer_loss
 
             optimizer.zero_grad()
@@ -205,7 +222,9 @@ def train(
         avg_cat_acc = sum(cat_acc.values()) / len(cat_acc)
         layer_acc = layer_count_correct / cat_total * 100
 
-        print(f"Epoch {epoch + 1}: loss={avg_loss:.4f}, cat_acc={avg_cat_acc:.1f}%, layer_count_acc={layer_acc:.1f}%")
+        print(
+            f"Epoch {epoch + 1}: loss={avg_loss:.4f}, cat_acc={avg_cat_acc:.1f}%, layer_count_acc={layer_acc:.1f}%"
+        )
         for k, acc in cat_acc.items():
             print(f"  {k}: {acc:.1f}%")
 

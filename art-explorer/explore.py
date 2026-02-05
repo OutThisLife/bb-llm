@@ -52,7 +52,12 @@ COLORS = [
 
 SCHEMA = {
     # Scalars
-    "Scalars.repetitions": {"type": "int", "range": (1, 500), "cma": (50, 500), "bias_min": 15},
+    "Scalars.repetitions": {
+        "type": "int",
+        "range": (1, 500),
+        "cma": (50, 500),
+        "bias_min": 15,
+    },
     "Scalars.alphaFactor": {"type": "float", "range": (0, 1), "cma": True},
     "Scalars.scaleFactor": {"type": "float", "range": (0, 2), "cma": (0.5, 3)},
     "Scalars.rotationFactor": {"type": "float", "range": (-1, 1), "cma": (-0.5, 0.5)},
@@ -108,6 +113,11 @@ SCHEMA = {
         ],
     },
     "Element.color": {"type": "color"},
+    # Noise effect
+    "Noise.enabled": {"type": "bool", "default": False},
+    "Noise.density": {"type": "float", "range": (0, 1), "default": 0.11},
+    "Noise.opacity": {"type": "float", "range": (0, 1), "default": 0.55},
+    "Noise.size": {"type": "float", "range": (0.1, 10), "default": 1.0},
 }
 
 # Layer schema (instantiated with prefix "Groups.g{i}.g{i}-")
@@ -249,7 +259,7 @@ def _random_value(spec):
             return random.randint(spec["bias_min"], hi)
         return random.randint(lo, hi)
     if t == "float":
-        return round(random.uniform(*spec["range"]), 2)
+        return round(random.uniform(*spec["range"]), 4)
     if t == "bool":
         return random.choice([True, False])
     if t == "cat":
@@ -257,7 +267,7 @@ def _random_value(spec):
     if t == "color":
         return random.choice(COLORS)
     if t == "obj":
-        return {k: round(random.uniform(*v), 2) for k, v in spec["axes"].items()}
+        return {k: round(random.uniform(*v), 4) for k, v in spec["axes"].items()}
     return None
 
 
@@ -265,19 +275,16 @@ def random_layer(i):
     """Generate random params for layer i."""
     pre = f"Groups.g{i}.g{i}-"
     p = {}
-    
+
     for name, spec in LAYER_SCHEMA.items():
         prob = spec.get("optional", 1.0)
         if random.random() < prob:
             val = _random_value(spec)
             if name == "position" and isinstance(val, dict):
                 # Clamp to visible range
-                val = {
-                    "x": max(-1, min(1, val["x"])),
-                    "y": max(-1, min(1, val["y"]))
-                }
+                val = {"x": max(-1, min(1, val["x"])), "y": max(-1, min(1, val["y"]))}
             p[f"{pre}{name}"] = val
-    
+
     return p
 
 
@@ -306,7 +313,7 @@ def random_params(n_layers=None):
         if n_layers is not None
         else random.choices(range(1, 6), weights=[4, 3, 2, 1, 1])[0]
     )
-    
+
     for i in range(n):
         params.update(random_layer(i))
 
@@ -404,9 +411,9 @@ def vec_to_params(vec, explore=True):
         v = lo + clamp(vec[i], 0, 1) * (hi - lo)
         if name.endswith(".x") or name.endswith(".y"):
             obj, axis = name.rsplit(".", 1)
-            params.setdefault(obj, {})[axis] = round(v, 2)
+            params.setdefault(obj, {})[axis] = round(v, 4)
         else:
-            params[name] = int(round(v)) if "repetitions" in name else round(v, 2)
+            params[name] = int(round(v)) if "repetitions" in name else round(v, 4)
 
     # Random exploration
     if explore:

@@ -52,7 +52,7 @@ def load_and_transform(image_path):
 
 def render_params(params, endpoint="http://localhost:3000/api/raster"):
     """Render params via API."""
-    resp = requests.post(endpoint, json=params, timeout=10)
+    resp = requests.post(endpoint, json=params, timeout=60)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content))
 
@@ -107,12 +107,25 @@ def validate_single(model, device, image_path, endpoint, save_dir=None):
         if k not in ("layers", "debug"):
             print(f"  {k}: {v}")
 
+    # Show layer predictions
+    layers = params.get("layers", [])
+    print(f"  layers: {len(layers)}")
+    for i, layer in enumerate(layers):
+        pos = layer.get("position", {})
+        scl = layer.get("scale", {})
+        rot = layer.get("rotation", 0)
+        print(
+            f"    [{i}] pos=({pos.get('x', 0):.2f}, {pos.get('y', 0):.2f}) "
+            f"scale=({scl.get('x', 1):.2f}, {scl.get('y', 1):.2f}) rot={rot:.2f}"
+        )
+
     # Render
     try:
         reconstructed = render_params(params, endpoint)
     except Exception as e:
         print(f"Render failed: {e}")
-        return None, params
+        print("Aborting - is bb-particles running?")
+        raise SystemExit(1)
 
     # Compare
     original = Image.open(image_path).convert("RGB")
