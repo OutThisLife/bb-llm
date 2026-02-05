@@ -1,11 +1,10 @@
 """LoRA fine-tuning on Mistral-7B. python demo_train.py"""
 
 import torch
-from unsloth import FastLanguageModel
 from datasets import Dataset
-from trl import SFTTrainer
 from transformers import TrainingArguments
-
+from trl import SFTTrainer
+from unsloth import FastLanguageModel
 from utils import jsonl_to_sft
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct"  # match gen_data.py

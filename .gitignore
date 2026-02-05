@@ -2,8 +2,9 @@ conda-env/
 __pycache__/
 out_adapter/
 unsloth_compiled_cache/
+.venv/
 
 *.pt
-data.jsonl
+data/
 *.log
 art_data/

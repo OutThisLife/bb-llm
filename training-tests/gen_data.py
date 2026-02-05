@@ -171,7 +171,7 @@ def main():
 
     pairs = []
     for i in range(args.calls):
-        print(f"\nBatch {i+1}/{args.calls}...")
+        print(f"\nBatch {i + 1}/{args.calls}...")
         try:
             raw = generate(
                 prompt_template.format(topic=args.topic, n=args.n), args.model

@@ -6,9 +6,8 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
 
 # --- Dataset ---
 
@@ -158,7 +157,7 @@ def show_logprobs(pairs: list):
 
     mean = sum(lp for _, lp in pairs) / len(pairs)
     ppl = math.exp(-mean)
-    print(f"  ─────────────┴────────┴──────")
+    print("  ─────────────┴────────┴──────")
     print(f"  Mean logprob: {mean:.2f} │ PPL: {ppl:.1f}")
 
 
@@ -316,7 +315,7 @@ def main():
         step += 1
         pbar.update(batch * seq)
         pbar.set_postfix(
-            loss=f"{loss_sum/n_loss:.3f}", lr=f"{opt.param_groups[0]['lr']:.1e}"
+            loss=f"{loss_sum / n_loss:.3f}", lr=f"{opt.param_groups[0]['lr']:.1e}"
         )
 
         # Eval
@@ -334,7 +333,7 @@ def main():
 
             status = " *" if improved else f" (no improve {no_improve}/{patience})"
             tqdm.write(
-                f"\n[{seen//1000}K/{budget//1000}K] train={train_loss:.3f} val={val_loss:.3f} ppl={math.exp(min(val_loss,20)):.1f} {(seen/(time.time()-t0))/1000:.0f}K/s{status}"
+                f"\n[{seen // 1000}K/{budget // 1000}K] train={train_loss:.3f} val={val_loss:.3f} ppl={math.exp(min(val_loss, 20)):.1f} {(seen / (time.time() - t0)) / 1000:.0f}K/s{status}"
             )
 
             out = sample(model, tok, device, "Q: What is RAM?", 50)

@@ -9,13 +9,12 @@ import random
 from pathlib import Path
 
 import torch
+from qwen_vl_utils import process_vision_info
 from transformers import (
-    Qwen2VLForConditionalGeneration,
     AutoProcessor,
     BitsAndBytesConfig,
+    Qwen2VLForConditionalGeneration,
 )
-from qwen_vl_utils import process_vision_info
-
 
 MODEL = "Qwen/Qwen2-VL-2B-Instruct"
 REFS_DIR = Path("references")
@@ -65,8 +64,8 @@ def score_image(image_path: str, debug=False) -> tuple[int, str]:
     torch.cuda.empty_cache()  # prevent fragmentation
 
     # Sanity check: reject blank/empty images
-    from PIL import Image
     import numpy as np
+    from PIL import Image
 
     img = np.array(Image.open(image_path).convert("L"))
     mean_brightness = img.mean()
@@ -123,7 +122,7 @@ def score_image(image_path: str, debug=False) -> tuple[int, str]:
     )[0].strip()
 
     if debug:
-        print(f"  [debug] raw: {repr(response)}")
+        print(f"  [debug] raw: {response!r}")
 
     try:
         score = int("".join(c for c in response if c.isdigit())[:2] or "5")
@@ -159,7 +158,7 @@ def batch_score(data_dir: str):
         if not screenshot.exists():
             continue
 
-        print(f"[{i+1}/{len(ratings)}] {screenshot.name}...", end=" ")
+        print(f"[{i + 1}/{len(ratings)}] {screenshot.name}...", end=" ")
         score, _ = score_image(str(screenshot))
         r["ai_score"] = score
         updated += 1

@@ -1,7 +1,8 @@
 """BPE tokenizer with BOS/EOS. Run standalone for demo."""
 
 from pathlib import Path
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from tokenizers.processors import TemplateProcessing
 
 # Special token IDs (order matters - matches trainer special_tokens order)

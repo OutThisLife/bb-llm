@@ -1,9 +1,10 @@
 """Inference for trained GPT. python infer.py [--temp 0.3] [checkpoint]"""
 
 import argparse
+
 import torch
-from train_gpt import MiniGPT, sample, sample_logprobs, show_logprobs
 from tokenizer import load_tokenizer
+from train_gpt import MiniGPT, sample, sample_logprobs, show_logprobs
 
 
 def main():

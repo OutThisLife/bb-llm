@@ -5,6 +5,10 @@ bitsandbytes
 accelerate
 qwen-vl-utils
 
+# Inverse model (Phase 2)
+timm>=0.9.0
+torchvision>=0.15.0
+
 # Optimization
 cma
 
@@ -14,6 +18,19 @@ playwright
 # Image processing
 Pillow
 numpy
+scikit-image>=0.21.0
+
+# Perceptual loss (Phase 4)
+lpips>=0.1.4
+
+# API calls
+requests>=2.28.0
 
 # Visualization (optional, for --preview)
 matplotlib
+PyQt6
+
+# Dev tools
+ruff
+pyright
+tqdm
