@@ -19,8 +19,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
-from explore import random_params
-from utils import to_scene_params
+from utils import random_params, to_scene_params
 
 DATA_DIR = Path("data")
 DATA_SCORED_DIR = Path("data-scored")
@@ -212,13 +211,13 @@ def _breed_from_refs(refs, n_layers, weights=None):
 
 
 def make_params(refs, n_layers, weights=None, breed_rate=0.3):
-    """Generate params, optionally biased by refs via crossover."""
+    """Generate params: stratified categoricals + optional ref breeding."""
     layers = n_layers if n_layers >= 0 else None
 
     if refs and random.random() < breed_rate:
         return _breed_from_refs(refs, layers, weights)
 
-    return random_params(n_layers=layers)
+    return random_params(n_layers=layers, stratified=True)
 
 
 def generate(

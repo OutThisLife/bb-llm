@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import requests
 import torch
-from inverse_model import InverseModel, reconstruct_params
+from model import InverseModel, reconstruct_params
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 from torchvision import transforms
@@ -41,7 +41,7 @@ def load_and_transform(image_path):
     """Load and transform image for inference."""
     transform = transforms.Compose(
         [
-            transforms.Resize((224, 224)),
+            transforms.Resize((512, 512)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
@@ -91,15 +91,16 @@ def validate_single(model, device, image_path, endpoint, save_dir=None):
     # Inference
     img_tensor = load_and_transform(image_path).unsqueeze(0).to(device)
     with torch.no_grad():
-        cont, cat, boolean, layer_count, layer_params = model(img_tensor)
+        cont, cat, boolean, layer_count, layer_params, layer_pres, layer_geos = model(img_tensor)
 
-    # Reconstruct params (including layers)
     params = reconstruct_params(
         cont[0],
         {k: v[0] for k, v in cat.items()},
         boolean[0],
         layer_count[0],
         [lp[0] for lp in layer_params],
+        [lp[0] for lp in layer_pres],
+        [lg[0] for lg in layer_geos],
     )
 
     print("Predicted params:")
@@ -114,9 +115,14 @@ def validate_single(model, device, image_path, endpoint, save_dir=None):
         pos = layer.get("position", {})
         scl = layer.get("scale", {})
         rot = layer.get("rotation", 0)
+        extras = []
+        for k in ("stepFactor", "alphaFactor", "scaleFactor", "rotationFactor", "geometry"):
+            if k in layer:
+                extras.append(f"{k}={layer[k]}")
+        extra_str = f" {' '.join(extras)}" if extras else ""
         print(
             f"    [{i}] pos=({pos.get('x', 0):.2f}, {pos.get('y', 0):.2f}) "
-            f"scale=({scl.get('x', 1):.2f}, {scl.get('y', 1):.2f}) rot={rot:.2f}"
+            f"scale=({scl.get('x', 1):.2f}, {scl.get('y', 1):.2f}) rot={rot:.2f}{extra_str}"
         )
 
     # Render
