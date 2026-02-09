@@ -7,4 +7,5 @@ unsloth_compiled_cache/
 *.pt
 data/
 *.log
+.ruff_cache/
 art_data/
