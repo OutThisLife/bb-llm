@@ -8,16 +8,31 @@ from utils import to_prefixed
 
 REFS_PATH = Path("references/refs.jsonl")
 DATA_DIR = Path("data/params")
+DATA_SCORED_DIR = Path("data-scored/params")
 
 
 def save_ref(sample_id: str):
-    """Append sample's params to refs.jsonl."""
+    """Append sample's params to refs.jsonl.
+
+    Supports:
+      - ID (e.g., 328) → from data/params/
+      - bias:ID (e.g., bias:328) → from data-scored/params/
+    """
+    # Check for bias: prefix
+    if sample_id.startswith("bias:"):
+        sample_id = sample_id[5:]  # remove "bias:"
+        data_dir = DATA_SCORED_DIR
+        source = "data-scored"
+    else:
+        data_dir = DATA_DIR
+        source = "data"
+
     # Strip extension if present (e.g., 000328.png → 000328)
     sample_id = sample_id.rsplit(".", 1)[0]
     sample_id = sample_id.lstrip("0") or "0"
     padded = f"{int(sample_id):06d}"
 
-    param_file = DATA_DIR / f"{padded}.json"
+    param_file = data_dir / f"{padded}.json"
     if not param_file.exists():
         print(f"Not found: {param_file}")
         return
@@ -42,11 +57,18 @@ def save_ref(sample_id: str):
             except json.JSONDecodeError:
                 continue  # skip malformed lines
 
+    # Ensure file ends with newline before appending
+    if REFS_PATH.exists():
+        content = REFS_PATH.read_text()
+        if content and not content.endswith("\n"):
+            with open(REFS_PATH, "a") as f:
+                f.write("\n")
+
     with open(REFS_PATH, "a") as f:
         f.write(json.dumps(prefixed) + "\n")
 
     total = len(REFS_PATH.read_text().strip().split("\n"))
-    print(f"Saved {padded} → refs.jsonl ({total} total)")
+    print(f"Saved {padded} ({source}) → refs.jsonl ({total} total)")
 
 
 def rm_ref(line_arg: str):

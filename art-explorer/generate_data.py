@@ -15,16 +15,43 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
-from explore import load_refs, random_params
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
+
+from explore import random_params
 from utils import to_scene_params
 
 DATA_DIR = Path("data")
+DATA_SCORED_DIR = Path("data-scored")
+REFS_PATH = Path("references/refs.jsonl")
+SCORED_PATH = Path("references/refs-scored.jsonl")
 API_URL = "http://localhost:3000/api/raster"
 # Dynamic workers: scale with CPU, cap at 8
 MAX_WORKERS = min(8, max(2, os.cpu_count() or 4))
+
+
+def load_refs():
+    """Load refs.jsonl for breeding."""
+    if not REFS_PATH.exists():
+        return []
+    lines = REFS_PATH.read_text().strip().split("\n")
+    return [json.loads(ln) for ln in lines if ln]
+
+
+def load_scored_refs():
+    """Load refs-scored.jsonl with weights for biased sampling."""
+    if not SCORED_PATH.exists():
+        print("refs-scored.jsonl not found. Run `make score-refs` first.")
+        return [], []
+    entries = []
+    for ln in SCORED_PATH.read_text().strip().split("\n"):
+        if ln:
+            entries.append(json.loads(ln))
+    params = [e["params"] for e in entries]
+    scores = [e["score"] for e in entries]
+    return params, scores
+
 
 # Thread-safe progress
 _pbar_lock = threading.Lock()
@@ -149,13 +176,21 @@ def generate_one(i, prefixed):
     return img_path, flat
 
 
-def _breed_from_refs(refs, n_layers):
+def _breed_from_refs(refs, n_layers, weights=None):
     """Crossover + partial inheritance from refs."""
-    # Pick 1-2 parents
-    if len(refs) >= 2 and random.random() < 0.7:
-        parents = random.sample(refs, 2)
+    # Pick 1-2 parents (weighted if scores provided)
+    if weights:
+        # Weighted random selection
+        if len(refs) >= 2 and random.random() < 0.7:
+            parents = random.choices(refs, weights=weights, k=2)
+        else:
+            parents = random.choices(refs, weights=weights, k=1)
     else:
-        parents = [random.choice(refs)]
+        # Uniform random
+        if len(refs) >= 2 and random.random() < 0.7:
+            parents = random.sample(refs, 2)
+        else:
+            parents = [random.choice(refs)]
 
     # Start with random params as base
     child = random_params(n_layers=n_layers)
@@ -176,20 +211,33 @@ def _breed_from_refs(refs, n_layers):
     return child
 
 
-def make_params(refs, n_layers):
+def make_params(refs, n_layers, weights=None, breed_rate=0.3):
     """Generate params, optionally biased by refs via crossover."""
     layers = n_layers if n_layers >= 0 else None
 
-    # 30% chance to breed from refs
-    if refs and random.random() < 0.3:
-        return _breed_from_refs(refs, layers)
+    if refs and random.random() < breed_rate:
+        return _breed_from_refs(refs, layers, weights)
 
     return random_params(n_layers=layers)
 
 
-def generate(n=2000, n_layers=0, preview=False, include_refs=True, workers=MAX_WORKERS):
+def generate(
+    n=2000,
+    n_layers=0,
+    preview=False,
+    include_refs=True,
+    workers=MAX_WORKERS,
+    scored=False,
+    data_dir=None,
+):
     """Generate n synthetic (image, params) pairs via API."""
-    global _pbar
+    global _pbar, DATA_DIR
+
+    # Use appropriate data directory
+    if data_dir:
+        DATA_DIR = data_dir
+    elif scored:
+        DATA_DIR = DATA_SCORED_DIR
 
     (DATA_DIR / "images").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "params").mkdir(parents=True, exist_ok=True)
@@ -200,10 +248,21 @@ def generate(n=2000, n_layers=0, preview=False, include_refs=True, workers=MAX_W
     if start_idx > 0:
         print(f"Continuing from index {start_idx} ({start_idx} existing)")
 
-    refs = load_refs() if include_refs else []
+    # Load refs (scored or regular)
+    weights = None
+    breed_rate = 0.3
 
-    if refs:
-        print(f"Including {len(refs)} reference params (30% breeding)")
+    if scored:
+        refs, weights = load_scored_refs()
+        breed_rate = 0.7  # Higher breeding rate for scored mode
+        if refs:
+            print(f"Scored mode: {len(refs)} refs, weighted breeding @ 70%")
+    elif include_refs:
+        refs = load_refs()
+        if refs:
+            print(f"Including {len(refs)} reference params (30% breeding)")
+    else:
+        refs = []
 
     # Preview mode: serial (so we can display)
     if preview:
@@ -211,19 +270,19 @@ def generate(n=2000, n_layers=0, preview=False, include_refs=True, workers=MAX_W
         pbar = tqdm(range(n), desc="Generating", unit="img")
 
         for i in pbar:
-            prefixed = make_params(refs, n_layers)
+            prefixed = make_params(refs, n_layers, weights, breed_rate)
             img_path, flat = generate_one(start_idx + i, prefixed)
             if img_path:
                 update_preview(fig, ax_img, ax_meta, img_path, flat, i, n)
 
-        print(f"Done: {n} samples")
+        print(f"Done: {n} samples in {DATA_DIR}/")
         return
 
     # Parallel mode: fast
     print(f"Generating {n} samples (parallel, {workers} workers)...")
 
     # Pre-generate all params (fast, CPU-bound)
-    all_params = [make_params(refs, n_layers) for _ in range(n)]
+    all_params = [make_params(refs, n_layers, weights, breed_rate) for _ in range(n)]
 
     # Shuffle to break any sequential patterns in random state
     random.shuffle(all_params)
@@ -241,7 +300,7 @@ def generate(n=2000, n_layers=0, preview=False, include_refs=True, workers=MAX_W
                 f.result()
         _pbar = None
 
-    print(f"Done: {n} samples")
+    print(f"Done: {n} samples in {DATA_DIR}/")
 
 
 def main():
@@ -257,7 +316,27 @@ def main():
         "--clean", action="store_true", help="Clear existing data before generating"
     )
     p.add_argument("--preview", action="store_true", help="Show preview window")
+    p.add_argument(
+        "--scored",
+        action="store_true",
+        help="Use refs-scored.jsonl with weighted breeding → data-scored/",
+    )
     args = p.parse_args()
+
+    # Scored mode: clean data-scored/, preview by default, serial
+    if args.scored:
+        if args.clean:
+            if DATA_SCORED_DIR.exists():
+                shutil.rmtree(DATA_SCORED_DIR)
+                print("Cleared data-scored/")
+        generate(
+            n=args.n,
+            n_layers=args.layers,
+            preview=True,  # always preview in scored mode
+            scored=True,
+            workers=1,  # serial for experimentation
+        )
+        return
 
     if args.clean:
         clear_data()

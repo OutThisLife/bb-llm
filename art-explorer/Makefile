@@ -24,7 +24,7 @@ iterate:
 
 # === Phase 1: Data Generation ===
 generate:
-	$(P) generate_data.py -n $(N) --clean
+	$(P) generate_data.py -n $(N)
 
 generate-preview:
 	$(P) generate_data.py -n $(N) --clean --preview
@@ -66,6 +66,20 @@ rm-ref:
 list-refs:
 	$(P) save_ref.py list
 
+# === Aesthetic Scoring (VLM) ===
+score-refs:
+	$(P) score_refs.py
+
+score-refs-fresh:
+	$(P) score_refs.py --rescore
+
+# === Biased Generation (experimental) ===
+generate-biased:
+	$(P) generate_data.py --scored -n 100
+
+generate-biased-clean:
+	$(P) generate_data.py --scored --clean -n 100
+
 # === Cleanup ===
 clean-data:
 	rm -rf data/
@@ -101,6 +115,12 @@ help:
 	@echo "            make rm-ref LINE=3       # remove by line number"
 	@echo "            make list-refs           # show all refs"
 	@echo ""
+	@echo "VLM Score:  make score-refs          # rank refs by aesthetic (Qwen2-VL)"
+	@echo "            make score-refs-fresh    # re-score all"
+	@echo ""
+	@echo "Biased:     make generate-biased     # weighted gen → data-scored/ (preview)"
+	@echo "            make save-ref ID=bias:42 # save from data-scored/"
+	@echo ""
 	@echo "Legacy:     make explore      # CMA-ES + VLM"
 	@echo "            make score IMG=path/to/img.png"
 	@echo ""
@@ -108,4 +128,6 @@ help:
 
 .PHONY: all generate generate-preview generate-more train train-long \
         validate validate-image explore explore-preview score iterate \
-        save-ref rm-ref list-refs clean-data clean-models clean-validation clean-all help
+        save-ref rm-ref list-refs score-refs score-refs-fresh \
+        generate-biased generate-biased-clean \
+        clean-data clean-models clean-validation clean-all help
