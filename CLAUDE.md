@@ -20,29 +20,19 @@ playwright install chromium
 ## Commands (run from `art-explorer/`)
 
 ```bash
-make iterate                # full lifecycle round: generate → train → explore
+make generate N=5000   # render refs + random/bred data → data/
+make train             # forward → inverse → taste → inverse finetune
+make discover          # balanced taste + novelty explore
+make loop N=5000       # generate + train + discover
 
-# Individual stages
-make generate N=5000        # random + ref-biased data → data/
-make generate-quality       # scored breeding → data/quality/
-make generate-preview       # serial with matplotlib preview window
-make train                  # forward model (20 epochs) + inverse model (10 epochs)
-make train-forward          # forward model only (coverage data)
-make train-inverse-quality  # inverse model on quality data only
-make train-inverse-all      # inverse model on coverage + quality data
-make predict IMG=path.png   # inverse: image → params (gradient + CMA-ES refine)
-make explore                # discover novel outputs (LPIPS novelty)
-make explore-clip           # discover novel outputs (CLIP novelty)
+# Ref curation
+make save-ref ID=328   # add from data/
+make save-ref ID=out:0 # add from output/
+make open-ref ID=328   # open in browser
+make list-refs         # show all refs
+make rm-ref LINE=3     # remove by line number
 
-# Reference management
-make list-refs              # show all refs
-make save-ref ID=328        # add sample from data/ to refs.jsonl
-make save-ref ID=out:0      # add sample from output/
-make rm-ref LINE=3          # remove by line number
-make score-refs             # VLM rank refs with Qwen2-VL
-make score-refs-fresh       # re-score all (ignore cache)
-
-make clean | clean-data | clean-quality | clean-output
+make clean             # rm data/ output/ models/
 ```
 
 ## Linting & Formatting
@@ -58,51 +48,51 @@ Config in `pyproject.toml`: Python 3.11, line-length 88, double quotes.
 ## Architecture
 
 ```
-Forward Model (params → image)     ←── trained on coverage data (random + bred)
+Forward Model (params → image)     ←── trained on coverage data (refs + random + bred)
         ↕ differentiable
-Gradient descent                   ←── backprop through forward model (~300 steps)
+Inverse Model (image → params)     ←── Phase 1: full coverage, Phase 2: taste-filtered top 20%
         ↕
-CMA-ES polish                     ←── black-box refinement (~500 fevals)
-        ↕
-Inverse Model (image → params)     ←── DINOv2-S backbone, trained on quality data
+Taste Model (params → score)       ←── refs (positive) vs random (negative)
         ↓
-Curation (save_ref)                ←── human picks the good ones → refs.jsonl
+Discover (taste + novelty)         ←── breed → forward model → rank → API render
         ↓
-Breeding (generate)                ←── refs.jsonl seeds next generation
+Curation (save_ref)                ←── human picks → refs.jsonl → next round
 ```
 
-### Two-Dataset Lifecycle
+### Training Lifecycle
 
 ```
-Round N:
-  1. Generate random data → data/          (coverage for forward model)
-  2. Train forward model on data/
-  3. Score refs → refs-scored.jsonl         (VLM aesthetic ranking)
-  4. Generate quality data → data/quality/  (heavily bred from scored refs)
-  5. Train inverse model on data/quality/   (DINOv2 backbone, frozen → unfrozen)
-  6. Explore → curate → refs grow
-  7. Repeat from 1
+make generate:
+  1. Render refs as guaranteed training samples
+  2. Generate random + ref-bred data → data/
+
+make train (4 phases):
+  1. Forward model on all data (L1 + LPIPS)
+  2. Inverse model on all data (param-space + perceptual loss)
+  3. Taste model: refs vs random data
+  4. Fine-tune inverse on taste-filtered top 20% (lower LR)
 ```
 
-Forward model needs uniform coverage (random data). Inverse model needs domain-relevant data (quality data bred from curated refs).
+All models train on the same `data/` directory. Refs are rendered into data so the inverse model directly sees curated examples. Taste model scores data to focus inverse fine-tuning on the interesting region.
 
 ### Pipeline Stages
 
-1. **generate.py** - Creates (image, params) training pairs via renderer API. Random, ref-biased, or VLM-score-weighted breeding. Supports `--out` for separate output directories.
+1. **generate.py** - Creates (image, params) training pairs via renderer API. Renders refs first, then random + ref-bred samples.
 
-2. **model.py** - Two models:
-   - **ForwardModel**: params → 3×256×256 image. 8×8 spatial bottleneck + self-attention at 32×32 + ConvTranspose2d decoder. ~11M params.
-   - **InverseModel**: image → params. DINOv2-S/14 backbone (384-dim features, pretrained) with multi-head MLP outputs for continuous, categorical, boolean, and per-layer params.
+2. **model.py** - Three models:
+   - **ForwardModel**: params → 3×256×256 image. Self-attention decoder. ~11M params.
+   - **InverseModel**: image → params. DINOv2-S/14 backbone with multi-head MLP outputs.
+   - **TasteModel**: param features → preference logit. Lightweight MLP.
 
-3. **train.py** - Two-phase training:
-   - Phase 1: Forward model on L1 + LPIPS perceptual loss (coverage data)
-   - Phase 2: Inverse model end-to-end (param-space loss + perceptual loss through frozen forward model). DINOv2 backbone frozen for 3 epochs then unfrozen with lower LR.
+3. **train.py** - Four-phase training:
+   - Phase 1: Forward model (L1 + LPIPS perceptual loss)
+   - Phase 2: Inverse model full coverage (param-space + perceptual loss through frozen forward)
+   - Phase 3: Taste model (refs vs random, BCE loss)
+   - Phase 4: Inverse fine-tune on taste-filtered top 20% (lower LR)
 
-4. **predict.py** - Three-stage inverse + explore:
-   - Inverse: CNN predict → config screening (CMA-ES) → gradient descent through forward model → CMA-ES polish → API render
-   - Explore: breed from refs → forward model scores novelty (LPIPS or CLIP) → top N rendered via API
-
-5. **score_refs.py** - Qwen2-VL aesthetic scoring (0-1) on rendered refs. Outputs `refs-scored.jsonl`.
+4. **predict.py** - Inverse prediction + explore:
+   - Inverse: CNN predict → CMA-ES → gradient descent → CMA-ES polish → API render
+   - Explore: breed from refs → taste + novelty scoring → top N rendered
 
 ### Two Parameter Formats
 
@@ -123,7 +113,6 @@ Converters in `utils.py`: `to_scene_params()` (prefixed → flat) and `to_prefix
 ### External Dependencies
 
 - Renderer API must be running at `localhost:3000` for data generation and prediction.
-- Qwen2-VL-2B-Instruct model (auto-downloaded) for aesthetic scoring.
 - DINOv2-S/14 pretrained weights via `timm` for the inverse model backbone.
 - CLIP-ViT-B/16 via `transformers` (optional, for `--clip` novelty scoring).
 - `lpips` AlexNet for perceptual loss (forward + inverse training, gradient/CMA-ES scoring).

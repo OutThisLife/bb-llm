@@ -42,8 +42,8 @@ SCHEMA = {
         "options": ["exponential", "linear", "inverse"],
     },
     "Scalars.positionProgression": {"type": "cat", "options": ["index", "scale"]},
-    "Spatial.xStep": {"type": "float", "range": (-2, 2)},
-    "Spatial.yStep": {"type": "float", "range": (-2, 2)},
+    "Spatial.xStep": {"type": "float", "range": (-2, 2), "center_bias": 0.7},
+    "Spatial.yStep": {"type": "float", "range": (-2, 2), "center_bias": 0.7},
     "Spatial.origin": {
         "type": "cat",
         "options": [
@@ -86,7 +86,7 @@ SCHEMA = {
 LAYER_SCHEMA = {
     "rotation": {"type": "float", "range": (-3.14159, 3.14159)},
     "position": {"type": "obj", "axes": {"x": (-2, 2), "y": (-2, 2)}},
-    "scale": {"type": "obj", "axes": {"x": (-2, 2), "y": (-2, 2)}},
+    "scale": {"type": "obj", "axes": {"x": (0.8, 1.2), "y": (0.8, 1.2)}},
     "stepFactor": {"type": "float", "range": (0, 2), "optional": 0.3},
     "alphaFactor": {"type": "float", "range": (0, 1), "optional": 0.3},
     "scaleFactor": {"type": "float", "range": (0, 2), "optional": 0.3},
@@ -113,7 +113,12 @@ def _random_value(spec):
             return random.randint(spec["bias_min"], hi)
         return random.randint(lo, hi)
     if t == "float":
-        return round(random.uniform(*spec["range"]), 4)
+        lo, hi = spec["range"]
+        if "center_bias" in spec and random.random() < spec["center_bias"]:
+            mid = (lo + hi) / 2
+            spread = (hi - lo) / 4
+            return round(max(lo, min(hi, random.gauss(mid, spread))), 4)
+        return round(random.uniform(lo, hi), 4)
     if t == "bool":
         return random.random() < spec.get("prob", 0.5)
     if t == "cat":
@@ -139,17 +144,57 @@ def random_layer(i):
     return p
 
 
+def _pick_mirror_axis():
+    """Randomly choose mirror axis: flip x, flip y, or flip both."""
+    return random.choice(["x", "y", "xy"])
+
+
+def _flip_scale(scale, axis):
+    """Negate scale on the given axis."""
+    x, y = scale.get("x", 1), scale.get("y", 1)
+    if "x" in axis:
+        x *= -1
+    if "y" in axis:
+        y *= -1
+    return {"x": x, "y": y}
+
+
+def _mirror_base(i, axis="x"):
+    """Fresh mirror layer: only position/rotation/scale (rest inherits from base)."""
+    pre = f"Groups.g{i}.g{i}-"
+    return {
+        f"{pre}position": {"x": 0, "y": 0},
+        f"{pre}rotation": 0,
+        f"{pre}scale": _flip_scale({"x": 1, "y": 1}, axis),
+    }
+
+
+def _mirror_layer(src, src_idx, dst_idx, axis="x"):
+    """Clone src layer into dst layer index, negate scale on axis."""
+    src_pre = f"Groups.g{src_idx}.g{src_idx}-"
+    dst_pre = f"Groups.g{dst_idx}.g{dst_idx}-"
+    p = {}
+    for k, v in src.items():
+        if k.startswith(src_pre):
+            suffix = k[len(src_pre):]
+            p[f"{dst_pre}{suffix}"] = v
+    src_scale = src.get(f"{src_pre}scale", {"x": 1, "y": 1})
+    p[f"{dst_pre}scale"] = _flip_scale(src_scale, axis)
+    return p
+
+
 _strat_counters = {}
 
 
 def random_params(n_layers=None, stratified=False):
     """Generate prefixed params. stratified=True cycles through categorical combos."""
+    symmetric = random.random() < 0.7
+
     params = {}
     for name, spec in SCHEMA.items():
         if "fixed" in spec:
             params[name] = spec["fixed"]
         elif stratified and spec["type"] == "cat":
-            # Round-robin through options
             opts = spec["options"]
             idx = _strat_counters.get(name, 0)
             params[name] = opts[idx % len(opts)]
@@ -157,14 +202,43 @@ def random_params(n_layers=None, stratified=False):
         else:
             params[name] = _random_value(spec)
 
+    if symmetric:
+        # Harmonic overrides tuned to ref distributions
+        params["Scalars.repetitions"] = random.randint(40, 250)
+        params["Scalars.scaleFactor"] = round(random.uniform(0.92, 1.08), 4)
+        params["Scalars.stepFactor"] = round(random.uniform(0.01, 0.6), 4)
+        params["Scalars.rotationFactor"] = round(random.uniform(-0.15, 0.15), 4)
+        params["Element.geometry"] = random.choices(
+            ["u", "ring", "arch", "bar", "square", "wave", "infinity", "line"],
+            weights=[27, 21, 14, 10, 10, 6, 5, 4],
+        )[0]
+        params["Scalars.rotationProgression"] = random.choices(
+            ["sine", "fibonacci", "golden-angle", "linear"],
+            weights=[53, 24, 13, 10],
+        )[0]
 
-    n = (
-        n_layers
-        if n_layers is not None
-        else random.choices(range(1, 6), weights=[4, 3, 2, 1, 1])[0]
-    )
-    for i in range(n):
-        params.update(random_layer(i))
+        axis = _pick_mirror_axis()
+        n_pairs = (
+            n_layers // 2 + 1
+            if n_layers is not None
+            else random.choice([1, 2, 3])
+        )
+        if n_pairs >= 1:
+            params.update(_mirror_base(0, axis))
+        for pair in range(1, n_pairs):
+            orig_idx = pair * 2 - 1
+            mirror_idx = pair * 2
+            orig = random_layer(orig_idx)
+            params.update(orig)
+            params.update(_mirror_layer(orig, orig_idx, mirror_idx, axis))
+    else:
+        n = (
+            n_layers
+            if n_layers is not None
+            else random.choices(range(0, 6), weights=[3, 4, 3, 2, 1, 1])[0]
+        )
+        for i in range(n):
+            params.update(random_layer(i))
 
     return params
 
@@ -306,8 +380,8 @@ CONTINUOUS_RANGES = {
     "geoWidth": (0.001, 0.1),
     "gradientAngle": (-3.14159, 3.14159),
     "noiseDensity": (0, 1),
-    "noiseOpacity": (0, 0.4),
-    "noiseSize": (0.1, 0.5),
+    "noiseOpacity": (0, 0.3),
+    "noiseSize": (0.1, 0.55),
     "ditherColors": (8, 32),
     "ditherStrength": (0.2, 0.8),
     "ditherScale": (1, 8),

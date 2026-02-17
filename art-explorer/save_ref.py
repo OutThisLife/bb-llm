@@ -8,64 +8,41 @@ from utils import to_prefixed
 
 REFS_PATH = Path("references/refs.jsonl")
 DATA_DIR = Path("data/params")
-QUALITY_DIR = Path("data/quality/params")
-DATA_SCORED_DIR = Path("data-scored/params")
 OUTPUT_DIR = Path("output/params")
 
 
-def save_ref(sample_id: str):
-    """Append sample's params to refs.jsonl.
-
-    Supports:
-      - ID (e.g., 328) → from data/params/
-      - q:ID / quality:ID (e.g., q:328) → from data/quality/params/
-      - bias:ID (e.g., bias:328) → from data-scored/params/
-      - out:ID (e.g., out:0) → from output/params/
-      - out:NAME (e.g., out:ref_000) → from output/params/ by name
-    """
+def _resolve_param_file(sample_id: str):
+    """Resolve sample ID to param file path. Returns Path or None."""
     if sample_id.startswith("out:"):
-        sample_id = sample_id[4:]
-        data_dir = OUTPUT_DIR
-        source = "output"
-    elif sample_id.startswith("quality:"):
-        sample_id = sample_id[8:]
-        data_dir = QUALITY_DIR
-        source = "quality"
-    elif sample_id.startswith("q:"):
-        sample_id = sample_id[2:]
-        data_dir = QUALITY_DIR
-        source = "quality"
-    elif sample_id.startswith("bias:"):
-        sample_id = sample_id[5:]
-        data_dir = DATA_SCORED_DIR
-        source = "data-scored"
+        sample_id, data_dir = sample_id[4:], OUTPUT_DIR
     else:
         data_dir = DATA_DIR
-        source = "data"
 
-    # Strip extension if present
     sample_id = sample_id.rsplit(".", 1)[0]
-
-    # Try exact name first (for output files like "ref_000" or "explore_003")
     param_file = data_dir / f"{sample_id}.json"
     if not param_file.exists():
-        # Try zero-padded numeric
         sample_id = sample_id.lstrip("0") or "0"
-        padded = f"{int(sample_id):06d}"
-        param_file = data_dir / f"{padded}.json"
-    else:
-        padded = sample_id
+        param_file = data_dir / f"{int(sample_id):06d}.json"
     if not param_file.exists():
         print(f"Not found: {param_file}")
+        return None
+    return param_file
+
+
+def save_ref(sample_id: str):
+    """Append sample's params to refs.jsonl."""
+    path = _resolve_param_file(sample_id)
+    if not path:
         return
 
-    with open(param_file) as f:
+    source = "output" if OUTPUT_DIR in path.parents else "data"
+
+    with open(path) as f:
         flat = json.load(f)
 
     flat.pop("url", None)
     prefixed = to_prefixed(flat)
 
-    # Check for duplicates
     REFS_PATH.parent.mkdir(exist_ok=True)
     new_json = json.dumps(prefixed, sort_keys=True)
     if REFS_PATH.exists():
@@ -74,12 +51,11 @@ def save_ref(sample_id: str):
                 continue
             try:
                 if json.dumps(json.loads(line), sort_keys=True) == new_json:
-                    print(f"Duplicate: {padded} already in refs.jsonl")
+                    print(f"Duplicate: {path.stem} already in refs.jsonl")
                     return
             except json.JSONDecodeError:
-                continue  # skip malformed lines
+                continue
 
-    # Ensure file ends with newline before appending
     if REFS_PATH.exists():
         content = REFS_PATH.read_text()
         if content and not content.endswith("\n"):
@@ -90,27 +66,21 @@ def save_ref(sample_id: str):
         f.write(json.dumps(prefixed) + "\n")
 
     total = len(REFS_PATH.read_text().strip().split("\n"))
-    print(f"Saved {padded} ({source}) → refs.jsonl ({total} total)")
+    print(f"Saved {path.stem} ({source}) → refs.jsonl ({total} total)")
 
 
 def rm_ref(line_arg: str):
     """Remove ref by line number (1-indexed)."""
-    # Strip extension if present
-    line_arg = line_arg.rsplit(".", 1)[0]
-    line_num = int(line_arg)
-
+    line_num = int(line_arg.rsplit(".", 1)[0])
     if not REFS_PATH.exists():
         print("refs.jsonl not found")
         return
-
     lines = REFS_PATH.read_text().strip().split("\n")
     if line_num < 1 or line_num > len(lines):
         print(f"Invalid line {line_num} (1-{len(lines)})")
         return
-
-    removed = lines.pop(line_num - 1)
+    lines.pop(line_num - 1)
     REFS_PATH.write_text("\n".join(lines) + "\n" if lines else "")
-
     print(f"Removed line {line_num} ({len(lines)} remaining)")
 
 
@@ -119,7 +89,6 @@ def list_refs():
     if not REFS_PATH.exists():
         print("refs.jsonl not found")
         return
-
     lines = REFS_PATH.read_text().strip().split("\n")
     for i, line in enumerate(lines, 1):
         data = json.loads(line)
@@ -128,24 +97,39 @@ def list_refs():
         print(f"{i:3d}. geo={geo}, rep={rep}")
 
 
+def open_ref(sample_id: str):
+    """Open sample in browser."""
+    import webbrowser
+
+    path = _resolve_param_file(sample_id)
+    if not path:
+        return
+    with open(path) as f:
+        flat = json.load(f)
+    url = flat.get("url")
+    if not url:
+        print(f"No url in {path}")
+        return
+    webbrowser.open(url)
+    print(f"Opened {path.stem}")
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
 
-    add = sub.add_parser("add", help="Add sample to refs")
-    add.add_argument("id", help="Sample ID (e.g., 328)")
-
-    rm = sub.add_parser("rm", help="Remove ref by line number")
-    rm.add_argument("line", help="Line number (1-indexed)")
-
+    sub.add_parser("add", help="Add sample to refs").add_argument("id")
+    sub.add_parser("rm", help="Remove by line number").add_argument("line")
+    sub.add_parser("open", help="Open in browser").add_argument("id")
     sub.add_parser("list", help="List refs")
 
     args = p.parse_args()
-
     if args.cmd == "add":
         save_ref(args.id)
     elif args.cmd == "rm":
         rm_ref(args.line)
+    elif args.cmd == "open":
+        open_ref(args.id)
     elif args.cmd == "list":
         list_refs()
     else:

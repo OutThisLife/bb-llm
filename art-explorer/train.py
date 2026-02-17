@@ -1,9 +1,10 @@
 """
-Train Forward + Inverse Models
-==============================
-Phase 1: Forward model (params → image) on pixel + perceptual loss.
-Phase 2: Inverse model (image → params) end-to-end through frozen forward model.
-         Supports quality-filtered data (--quality) for the two-dataset lifecycle.
+Train Forward + Inverse + Taste Models
+=======================================
+All models train on the same coverage data (data/).
+Forward: params → image (L1 + LPIPS perceptual loss)
+Inverse: image → params (param-space + perceptual loss through frozen forward model)
+Taste: refs vs random (binary classifier on param features)
 """
 
 import argparse
@@ -41,7 +42,6 @@ from utils import (
 IMG_SIZE = 252  # divisible by DINOv2 patch size (14)
 FWD_SIZE = 256
 REFS_PATH = Path("references/refs.jsonl")
-SCORED_REFS_PATH = Path("references/refs-scored.jsonl")
 
 _normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
@@ -67,14 +67,9 @@ RAW_TRANSFORM = transforms.Compose([
 
 
 class ParamsDataset(Dataset):
-    def __init__(self, data_dirs, transform=None, raw_transform=None):
-        """Load from one or more data directories."""
-        if isinstance(data_dirs, (str, Path)):
-            data_dirs = [data_dirs]
-        self.images = []
-        for d in data_dirs:
-            d = Path(d)
-            self.images.extend(sorted(d.glob("images/*.png")))
+    def __init__(self, data_dir="data", transform=None, raw_transform=None):
+        d = Path(data_dir)
+        self.images = sorted(d.glob("images/*.png"))
         self.transform = transform or TRAIN_TRANSFORM
         self.raw_transform = raw_transform or RAW_TRANSFORM
 
@@ -131,247 +126,149 @@ def collate_fn(batch):
     (imgs, imgs_raw, conts, cats, bools,
      layer_counts, layer_targets, layer_pres, layer_geos) = zip(*batch)
 
-    imgs = torch.stack(imgs)
-    imgs_raw = torch.stack(imgs_raw)
-    conts = torch.stack(conts)
-    bools = torch.stack(bools)
-    layer_counts = torch.tensor(layer_counts, dtype=torch.long)
-
     cat_tensors = {
         name: torch.tensor([c[name] for c in cats], dtype=torch.long)
         for name in CATEGORICAL_KEYS
     }
 
-    layer_tensors = [torch.stack([lt[i] for lt in layer_targets]) for i in range(MAX_LAYERS)]
-    layer_pres_tensors = [torch.stack([lp[i] for lp in layer_pres]) for i in range(MAX_LAYERS)]
-    layer_geo_tensors = [torch.tensor([lg[i] for lg in layer_geos], dtype=torch.long) for i in range(MAX_LAYERS)]
+    return (
+        torch.stack(imgs), torch.stack(imgs_raw), torch.stack(conts),
+        cat_tensors, torch.stack(bools), torch.tensor(layer_counts, dtype=torch.long),
+        [torch.stack([lt[i] for lt in layer_targets]) for i in range(MAX_LAYERS)],
+        [torch.stack([lp[i] for lp in layer_pres]) for i in range(MAX_LAYERS)],
+        [torch.tensor([lg[i] for lg in layer_geos], dtype=torch.long) for i in range(MAX_LAYERS)],
+    )
 
-    return (imgs, imgs_raw, conts, cat_tensors, bools,
-            layer_counts, layer_tensors, layer_pres_tensors, layer_geo_tensors)
 
-
-# ============================================================================
-# Taste model dataset + training
-# ============================================================================
-
+# ── Taste ──
 
 class TasteDataset(Dataset):
-    def __init__(self, features, labels, weights=None):
+    def __init__(self, features, labels):
         self.x = torch.tensor(features, dtype=torch.float32)
         self.y = torch.tensor(labels, dtype=torch.float32)
-        self.w = torch.tensor(weights if weights is not None else [1.0] * len(labels), dtype=torch.float32)
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.x[idx], self.y[idx], self.w[idx]
+        return self.x[idx], self.y[idx]
 
 
-def _load_jsonl(path):
-    if not path.exists():
-        return []
-    text = path.read_text().strip()
-    if not text:
-        return []
-    return [json.loads(ln) for ln in text.split("\n") if ln]
+def train_taste(data_dir="data", epochs=12, lr=3e-4, save_path="models/taste_model.pt"):
+    device = get_device()
+    print(f"[Taste] Device: {device}")
 
+    refs = []
+    if REFS_PATH.exists():
+        for ln in REFS_PATH.read_text().strip().split("\n"):
+            if ln:
+                refs.append(json.loads(ln))
+    if not refs:
+        print("[Taste] No refs. Add refs first.")
+        return
 
-def _collect_negative_params(data_dirs, target_count):
-    candidates = []
-    for d in data_dirs:
-        d = Path(d)
-        candidates.extend(sorted((d / "params").glob("*.json")))
-    if not candidates:
-        return []
-    if len(candidates) > target_count:
-        candidates = random.sample(candidates, target_count)
-    out = []
-    for p in candidates:
+    # Positives = refs
+    pos = [encode_taste_features(r) for r in refs]
+
+    # Negatives = random sample from generated data
+    neg_paths = sorted((Path(data_dir) / "params").glob("*.json"))
+    neg_count = max(len(pos) * 4, 2000)
+    if len(neg_paths) > neg_count:
+        neg_paths = random.sample(neg_paths, neg_count)
+
+    neg = []
+    for p in neg_paths:
         try:
             params = json.loads(p.read_text())
             params.pop("url", None)
-            out.append(params)
+            neg.append(encode_taste_features(params))
         except Exception:
             continue
-    return out
 
-
-def train_taste(
-    data_dirs="data",
-    epochs=12,
-    batch_size=0,
-    lr=3e-4,
-    save_path="models/taste_model.pt",
-):
-    if isinstance(data_dirs, (str, Path)):
-        data_dirs = [data_dirs]
-    device = get_device()
-    if batch_size <= 0:
-        batch_size = max(64, auto_batch_size(model_vram_mb=40))
-    print(f"[Taste] Device: {device}")
-
-    refs = _load_jsonl(REFS_PATH)
-    if not refs:
-        print("[Taste] No refs found. Add refs first.")
-        return
-
-    scored = _load_jsonl(SCORED_REFS_PATH)
-    scored_map = {
-        json.dumps(e.get("params", {}), sort_keys=True): float(e.get("score", 0.8))
-        for e in scored
-    }
-
-    pos_features, pos_labels, pos_weights = [], [], []
-    for ref in refs:
-        pos_features.append(encode_taste_features(ref))
-        pos_labels.append(1.0)
-        key = json.dumps(ref, sort_keys=True)
-        pos_weights.append(max(0.2, scored_map.get(key, 1.0)))
-
-    neg = _collect_negative_params(data_dirs, target_count=max(len(pos_features) * 4, 2000))
     if not neg:
-        print("[Taste] No negative pool in data dirs. Generate data first.")
+        print("[Taste] No data for negatives. Generate first.")
         return
 
-    neg_features = [encode_taste_features(p) for p in neg]
-    neg_labels = [0.0] * len(neg_features)
-    neg_weights = [1.0] * len(neg_features)
-
-    features = pos_features + neg_features
-    labels = pos_labels + neg_labels
-    weights = pos_weights + neg_weights
-    dataset = TasteDataset(features, labels, weights)
+    features = pos + neg
+    labels = [1.0] * len(pos) + [0.0] * len(neg)
+    dataset = TasteDataset(features, labels)
 
     val_size = max(1, len(dataset) // 10)
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
 
+    batch_size = max(64, auto_batch_size(model_vram_mb=40))
     n_workers = auto_workers()
-    loader_args = dict(
-        batch_size=batch_size,
-        num_workers=n_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=n_workers > 0,
-    )
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_args)
-    print(f"[Taste] Dataset: {train_size} train, {val_size} val")
-    print(f"[Taste] Positives: {len(pos_features)}, negatives: {len(neg_features)}")
+    args = dict(batch_size=batch_size, num_workers=n_workers,
+                pin_memory=device.type == "cuda", persistent_workers=n_workers > 0)
+    train_loader = DataLoader(train_ds, shuffle=True, **args)
+    val_loader = DataLoader(val_ds, shuffle=False, **args)
+    print(f"[Taste] {len(pos)} refs vs {len(neg)} negatives")
 
     model = TasteModel(in_dim=TASTE_FEATURE_DIM).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+    criterion = torch.nn.BCEWithLogitsLoss()
 
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
 
     for epoch in range(epochs):
         model.train()
-        total_loss = 0.0
-        correct = 0
-        seen = 0
-
-        pbar = tqdm(train_loader, desc=f"[Taste] Epoch {epoch + 1}/{epochs}")
-        for x, y, w in pbar:
-            x = x.to(device)
-            y = y.to(device)
-            w = w.to(device)
-
+        total_loss, correct, seen = 0, 0, 0
+        for x, y in tqdm(train_loader, desc=f"[Taste] {epoch+1}/{epochs}"):
+            x, y = x.to(device), y.to(device)
             logits = model(x)
-            loss = (criterion(logits, y) * w).mean()
-
+            loss = criterion(logits, y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
-            pred = (torch.sigmoid(logits) > 0.5).float()
-            correct += (pred == y).sum().item()
+            correct += ((torch.sigmoid(logits) > 0.5).float() == y).sum().item()
             seen += y.numel()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         scheduler.step()
-        train_loss = total_loss / len(train_loader)
-        train_acc = correct / max(1, seen)
 
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_seen = 0
+        val_loss = 0
         with torch.no_grad():
-            for x, y, w in val_loader:
-                x = x.to(device)
-                y = y.to(device)
-                w = w.to(device)
-                logits = model(x)
-                loss = (criterion(logits, y) * w).mean()
-                val_loss += loss.item()
-                pred = (torch.sigmoid(logits) > 0.5).float()
-                val_correct += (pred == y).sum().item()
-                val_seen += y.numel()
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                val_loss += criterion(model(x), y).item()
         val_loss /= len(val_loader)
-        val_acc = val_correct / max(1, val_seen)
 
-        print(
-            f"[Taste] Epoch {epoch + 1}: loss={train_loss:.4f}, acc={train_acc*100:.1f}%, "
-            f"val_loss={val_loss:.4f}, val_acc={val_acc*100:.1f}%"
-        )
+        print(f"[Taste] Epoch {epoch+1}: loss={total_loss/len(train_loader):.4f}, "
+              f"acc={correct/seen*100:.1f}%, val={val_loss:.4f}")
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "feature_dim": TASTE_FEATURE_DIM,
-                },
-                save_path,
-            )
-            print(f"  Saved (best val_loss={val_loss:.4f})")
+            torch.save({"model_state_dict": model.state_dict(),
+                        "feature_dim": TASTE_FEATURE_DIM}, save_path)
 
-    print(f"[Taste] Done. Best val_loss={best_val:.4f} -> {save_path}")
+    print(f"[Taste] Done → {save_path}")
 
 
-# ============================================================================
-# Phase 1: Train Forward Model
-# ============================================================================
+# ── Forward ──
 
-
-def train_forward(
-    data_dirs="data",
-    epochs=20,
-    batch_size=0,
-    lr=2e-4,
-    save_path="models/forward_model.pt",
-):
-    if batch_size <= 0:
-        batch_size = auto_batch_size(model_vram_mb=100)
+def train_forward(data_dir="data", epochs=20, lr=2e-4, save_path="models/forward_model.pt"):
+    batch_size = auto_batch_size(model_vram_mb=100)
     device = get_device()
     print(f"[Forward] Device: {device}")
 
-    full_dataset = ParamsDataset(data_dirs)
-    if len(full_dataset) == 0:
-        print("No data found. Run generate.py first.")
+    full = ParamsDataset(data_dir)
+    if not len(full):
+        print("No data. Run generate.py first.")
         return
 
-    val_size = max(1, len(full_dataset) // 10)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    val_dataset.dataset = ParamsDataset(data_dirs, transform=VAL_TRANSFORM)
-    print(f"[Forward] Dataset: {train_size} train, {val_size} val")
+    val_size = max(1, len(full) // 10)
+    train_ds, val_ds = random_split(full, [len(full) - val_size, val_size])
+    val_ds.dataset = ParamsDataset(data_dir, transform=VAL_TRANSFORM)
 
     n_workers = auto_workers()
-    loader_args = dict(
-        batch_size=batch_size, collate_fn=collate_fn,
-        num_workers=n_workers, pin_memory=device.type == "cuda", persistent_workers=True,
-    )
-    loader = DataLoader(train_dataset, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
-    print(f"[Forward] batch={batch_size}, workers={n_workers}")
+    kw = dict(batch_size=batch_size, collate_fn=collate_fn, num_workers=n_workers,
+              pin_memory=device.type == "cuda", persistent_workers=True)
+    loader = DataLoader(train_ds, shuffle=True, **kw)
+    val_loader = DataLoader(val_ds, shuffle=False, **kw)
+    print(f"[Forward] {len(full)} samples, batch={batch_size}")
 
     model = ForwardModel().to(device)
     if device.type == "cuda":
@@ -379,148 +276,105 @@ def train_forward(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    lpips_model = lpips.LPIPS(net="alex", verbose=False).to(device)
-    lpips_model.eval()
-    for p in lpips_model.parameters():
+    lpips_fn = lpips.LPIPS(net="alex", verbose=False).to(device)
+    lpips_fn.eval()
+    for p in lpips_fn.parameters():
         p.requires_grad = False
 
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
-
-    best_val_loss = float("inf")
+    best_val = float("inf")
 
     for epoch in range(epochs):
         model.train()
-        total_loss, total_l1, total_lpips = 0, 0, 0
+        total_loss = 0
 
-        pbar = tqdm(loader, desc=f"[Fwd] Epoch {epoch + 1}/{epochs}")
-        for batch in pbar:
-            (imgs, imgs_raw, conts, cat_targets, bool_targets,
-             layer_counts, layer_targets, layer_pres_targets, layer_geo_targets) = batch
-
-            imgs_raw = imgs_raw.to(device)
-            conts = conts.to(device)
-            bool_targets = bool_targets.to(device)
-            layer_counts = layer_counts.to(device)
-            cat_dev = {k: v.to(device) for k, v in cat_targets.items()}
-            lt_dev = [lt.to(device) for lt in layer_targets]
-            lp_dev = [lp.to(device) for lp in layer_pres_targets]
-            lg_dev = [lg.to(device) for lg in layer_geo_targets]
+        for batch in tqdm(loader, desc=f"[Fwd] {epoch+1}/{epochs}"):
+            (_, imgs_raw, conts, cats, bools, lc, lt, lp, lg) = batch
+            imgs_raw, conts, bools, lc = [t.to(device) for t in [imgs_raw, conts, bools, lc]]
+            cats = {k: v.to(device) for k, v in cats.items()}
+            lt = [t.to(device) for t in lt]
+            lp = [t.to(device) for t in lp]
+            lg = [t.to(device) for t in lg]
 
             with torch.amp.autocast(device.type, enabled=use_amp):
-                pred_img = model(conts, cat_dev, bool_targets, layer_counts, lt_dev, lp_dev, lg_dev)
-                l1_loss = F.l1_loss(pred_img, imgs_raw)
-                perc_loss = lpips_model(pred_img * 2 - 1, imgs_raw * 2 - 1).mean()
-                loss = l1_loss + 0.5 * perc_loss
+                pred = model(conts, cats, bools, lc, lt, lp, lg)
+                l1 = F.l1_loss(pred, imgs_raw)
+                perc = lpips_fn(pred * 2 - 1, imgs_raw * 2 - 1).mean()
+                loss = l1 + 0.5 * perc
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
             total_loss += loss.item()
-            total_l1 += l1_loss.item()
-            total_lpips += perc_loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}", l1=f"{l1_loss.item():.4f}")
 
         scheduler.step()
-        avg_loss = total_loss / len(loader)
-        avg_l1 = total_l1 / len(loader)
-        avg_lpips = total_lpips / len(loader)
 
-        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                (_, imgs_raw, conts, cat_targets, bool_targets,
-                 layer_counts, layer_targets, layer_pres_targets, layer_geo_targets) = batch
-                imgs_raw = imgs_raw.to(device)
-                conts = conts.to(device)
-                bool_targets = bool_targets.to(device)
-                layer_counts = layer_counts.to(device)
-                cat_dev = {k: v.to(device) for k, v in cat_targets.items()}
-                lt_dev = [lt.to(device) for lt in layer_targets]
-                lp_dev = [lp.to(device) for lp in layer_pres_targets]
-                lg_dev = [lg.to(device) for lg in layer_geo_targets]
-                pred_img = model(conts, cat_dev, bool_targets, layer_counts, lt_dev, lp_dev, lg_dev)
-                val_loss += F.l1_loss(pred_img, imgs_raw).item()
+                (_, imgs_raw, conts, cats, bools, lc, lt, lp, lg) = batch
+                imgs_raw, conts, bools, lc = [t.to(device) for t in [imgs_raw, conts, bools, lc]]
+                cats = {k: v.to(device) for k, v in cats.items()}
+                lt = [t.to(device) for t in lt]
+                lp = [t.to(device) for t in lp]
+                lg = [t.to(device) for t in lg]
+                pred = model(conts, cats, bools, lc, lt, lp, lg)
+                val_loss += F.l1_loss(pred, imgs_raw).item()
         val_loss /= len(val_loader)
 
-        print(
-            f"[Fwd] Epoch {epoch + 1}: loss={avg_loss:.4f} "
-            f"(l1={avg_l1:.4f}, lpips={avg_lpips:.4f}), val_l1={val_loss:.4f}"
-        )
+        print(f"[Fwd] Epoch {epoch+1}: loss={total_loss/len(loader):.4f}, val_l1={val_loss:.4f}")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(
-                {"epoch": epoch, "model_state_dict": model.state_dict(),
-                 "optimizer_state_dict": optimizer.state_dict(), "val_loss": val_loss},
-                save_path,
-            )
-            print(f"  Saved (best val_l1={val_loss:.4f})")
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save({"model_state_dict": model.state_dict()}, save_path)
+            print(f"  Saved (best={val_loss:.4f})")
 
-    print(f"[Forward] Done. Best val_l1={best_val_loss:.4f} → {save_path}")
+    print(f"[Forward] Done → {save_path}")
 
 
-# ============================================================================
-# Phase 2: Train Inverse Model
-# ============================================================================
-
+# ── Inverse ──
 
 def train_inverse(
-    data_dirs="data",
-    epochs=10,
-    batch_size=0,
-    lr=1e-4,
-    save_path="models/inverse_model.pt",
-    forward_path="models/forward_model.pt",
-    perceptual_weight=0.5,
-    freeze_backbone=3,
+    data_dir="data", epochs=10, lr=1e-4, save_path="models/inverse_model.pt",
+    forward_path="models/forward_model.pt", perc_weight=0.5, freeze_backbone=3,
 ):
-    if batch_size <= 0:
-        batch_size = auto_batch_size(model_vram_mb=400)  # DINOv2 + forward model
+    batch_size = auto_batch_size(model_vram_mb=400)
     device = get_device()
     print(f"[Inverse] Device: {device}")
 
-    full_dataset = ParamsDataset(data_dirs)
-    if len(full_dataset) == 0:
-        print("No data found.")
+    full = ParamsDataset(data_dir)
+    if not len(full):
+        print("No data.")
         return
 
-    val_size = max(1, len(full_dataset) // 10)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    val_dataset.dataset = ParamsDataset(data_dirs, transform=VAL_TRANSFORM)
-    print(f"[Inverse] Dataset: {train_size} train, {val_size} val")
+    val_size = max(1, len(full) // 10)
+    train_ds, val_ds = random_split(full, [len(full) - val_size, val_size])
+    val_ds.dataset = ParamsDataset(data_dir, transform=VAL_TRANSFORM)
 
     n_workers = auto_workers()
-    loader_args = dict(
-        batch_size=batch_size, collate_fn=collate_fn,
-        num_workers=n_workers, pin_memory=device.type == "cuda", persistent_workers=True,
-    )
-    loader = DataLoader(train_dataset, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
-    print(f"[Inverse] batch={batch_size}, workers={n_workers}")
+    kw = dict(batch_size=batch_size, collate_fn=collate_fn, num_workers=n_workers,
+              pin_memory=device.type == "cuda", persistent_workers=True)
+    loader = DataLoader(train_ds, shuffle=True, **kw)
+    val_loader = DataLoader(val_ds, shuffle=False, **kw)
+    print(f"[Inverse] {len(full)} samples, batch={batch_size}")
 
     inverse = InverseModel(pretrained=True).to(device)
 
-    # Freeze DINOv2 backbone for initial epochs
     if freeze_backbone > 0:
         for p in inverse.backbone.parameters():
             p.requires_grad = False
-        print(f"[Inverse] DINOv2 backbone frozen for {freeze_backbone} epochs")
+        print(f"[Inverse] Backbone frozen for {freeze_backbone} epochs")
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, inverse.parameters()), lr=lr,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # Forward model (frozen) for perceptual loss
-    forward_model, lpips_model = None, None
+    forward_model, lpips_fn = None, None
     if Path(forward_path).exists():
         forward_model = ForwardModel().to(device)
         ckpt = torch.load(forward_path, map_location=device, weights_only=False)
@@ -528,15 +382,12 @@ def train_inverse(
         forward_model.eval()
         for p in forward_model.parameters():
             p.requires_grad = False
-        lpips_model = lpips.LPIPS(net="alex", verbose=False).to(device)
-        lpips_model.eval()
-        for p in lpips_model.parameters():
+        lpips_fn = lpips.LPIPS(net="alex", verbose=False).to(device)
+        lpips_fn.eval()
+        for p in lpips_fn.parameters():
             p.requires_grad = False
-        print(f"[Inverse] Forward model loaded (frozen)")
-    else:
-        print(f"[Inverse] No forward model — param-space loss only")
+        print("[Inverse] Forward model loaded (frozen)")
 
-    # Loss weights
     w = {"cont": 1.0, "cat": 1.0, "bool": 0.5, "lc": 1.0,
          "layer": 0.5, "lpres": 0.3, "lgeo": 0.3}
 
@@ -545,11 +396,9 @@ def train_inverse(
     scaler = torch.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(epochs):
-        # Unfreeze backbone after freeze_backbone epochs
         if epoch == freeze_backbone and freeze_backbone > 0:
             for p in inverse.backbone.parameters():
                 p.requires_grad = True
-            # Rebuild optimizer with all params + lower LR for backbone
             optimizer = torch.optim.AdamW([
                 {"params": inverse.backbone.parameters(), "lr": lr * 0.1},
                 {"params": [p for n, p in inverse.named_parameters()
@@ -561,186 +410,282 @@ def train_inverse(
             print(f"[Inverse] Backbone unfrozen (lr={lr * 0.1:.1e})")
 
         inverse.train()
-        total_loss, total_param, total_perc = 0, 0, 0
-        cat_correct = {k: 0 for k in CATEGORICAL_KEYS}
-        layer_count_correct, cat_total = 0, 0
+        total_loss = 0
 
-        perc_w = perceptual_weight * min(1.0, (epoch + 1) / max(1, epochs // 2))
+        pw = perc_weight * min(1.0, (epoch + 1) / max(1, epochs // 2))
 
-        pbar = tqdm(loader, desc=f"[Inv] Epoch {epoch + 1}/{epochs}")
-        for batch in pbar:
-            (imgs, imgs_raw, cont_targets, cat_targets, bool_targets,
-             layer_count_targets, layer_targets, layer_pres_targets, layer_geo_targets) = batch
-
-            imgs = imgs.to(device)
-            imgs_raw = imgs_raw.to(device)
-            cont_targets = cont_targets.to(device)
-            bool_targets = bool_targets.to(device)
-            layer_count_targets = layer_count_targets.to(device)
+        for batch in tqdm(loader, desc=f"[Inv] {epoch+1}/{epochs}"):
+            (imgs, imgs_raw, cont_t, cat_t, bool_t, lc_t, lt_t, lp_t, lg_t) = batch
+            imgs, imgs_raw = imgs.to(device), imgs_raw.to(device)
+            cont_t, bool_t, lc_t = cont_t.to(device), bool_t.to(device), lc_t.to(device)
 
             with torch.amp.autocast(device.type, enabled=use_amp):
-                (cont_pred, cat_pred, bool_pred, layer_count_pred,
-                 layer_preds, layer_pres_preds, layer_geo_preds) = inverse(imgs)
+                (cont_p, cat_p, bool_p, lc_p, l_ps, lpr_ps, lg_ps) = inverse(imgs)
 
-                # Param-space loss
-                param_loss = w["cont"] * F.mse_loss(cont_pred, cont_targets)
-
-                for k, pred in cat_pred.items():
-                    target = cat_targets[k].to(device)
-                    param_loss = param_loss + w["cat"] * F.cross_entropy(pred, target)
-                    cat_correct[k] += (pred.argmax(1) == target).sum().item()
-
-                param_loss = param_loss + w["bool"] * F.binary_cross_entropy_with_logits(
-                    bool_pred, bool_targets
-                )
-                param_loss = param_loss + w["lc"] * F.cross_entropy(
-                    layer_count_pred, layer_count_targets
-                )
-                layer_count_correct += (layer_count_pred.argmax(1) == layer_count_targets).sum().item()
+                loss = w["cont"] * F.mse_loss(cont_p, cont_t)
+                for k, pred in cat_p.items():
+                    loss = loss + w["cat"] * F.cross_entropy(pred, cat_t[k].to(device))
+                loss = loss + w["bool"] * F.binary_cross_entropy_with_logits(bool_p, bool_t)
+                loss = loss + w["lc"] * F.cross_entropy(lc_p, lc_t)
 
                 for i in range(MAX_LAYERS):
-                    has_layer = (layer_count_targets > i).float()
-                    mask = has_layer.unsqueeze(1)
+                    mask = (lc_t > i).float().unsqueeze(1)
                     if mask.sum() == 0:
                         continue
-                    lt = layer_targets[i].to(device)
-                    param_loss = param_loss + w["layer"] * (
-                        ((layer_preds[i] - lt) ** 2 * mask).sum() / mask.sum()
-                    )
-                    pt = layer_pres_targets[i].to(device)
-                    param_loss = param_loss + w["lpres"] * (
-                        (F.binary_cross_entropy_with_logits(
-                            layer_pres_preds[i], pt, reduction="none") * mask
-                        ).sum() / mask.sum()
-                    )
-                    gt = layer_geo_targets[i].to(device)
-                    geo_present = pt[:, LAYER_OPTIONALS.index("geometry")].bool() & has_layer.bool()
-                    if geo_present.sum() > 0:
-                        param_loss = param_loss + w["lgeo"] * F.cross_entropy(
-                            layer_geo_preds[i][geo_present], gt[geo_present]
-                        )
+                    loss = loss + w["layer"] * (((l_ps[i] - lt_t[i].to(device)) ** 2 * mask).sum() / mask.sum())
+                    loss = loss + w["lpres"] * ((F.binary_cross_entropy_with_logits(
+                        lpr_ps[i], lp_t[i].to(device), reduction="none") * mask).sum() / mask.sum())
+                    gt = lg_t[i].to(device)
+                    geo_on = lp_t[i][:, LAYER_OPTIONALS.index("geometry")].bool().to(device) & (lc_t > i).bool()
+                    if geo_on.sum() > 0:
+                        loss = loss + w["lgeo"] * F.cross_entropy(lg_ps[i][geo_on], gt[geo_on])
 
-                loss = param_loss
-
-                # Perceptual loss through forward model
-                if forward_model is not None and perc_w > 0:
-                    cont_clamped = cont_pred.clamp(0, 1)
-                    cat_idx = {k: pred.argmax(1) for k, pred in cat_pred.items()}
-                    lc_idx = layer_count_pred.argmax(1)
-                    lc_list = [lp.clamp(0, 1) for lp in layer_preds]
-                    lp_list = list(layer_pres_preds)
-                    lg_list = [lg.argmax(1) for lg in layer_geo_preds]
-
+                if forward_model is not None and pw > 0:
                     fwd_img = forward_model(
-                        cont_clamped, cat_idx, bool_pred, lc_idx,
-                        lc_list, lp_list, lg_list,
+                        cont_p.clamp(0, 1),
+                        {k: p.argmax(1) for k, p in cat_p.items()},
+                        bool_p, lc_p.argmax(1),
+                        [lp.clamp(0, 1) for lp in l_ps],
+                        list(lpr_ps),
+                        [lg.argmax(1) for lg in lg_ps],
                     )
-                    perc_loss = lpips_model(fwd_img * 2 - 1, imgs_raw * 2 - 1).mean()
-                    loss = loss + perc_w * perc_loss
-                    total_perc += perc_loss.item()
+                    loss = loss + pw * lpips_fn(fwd_img * 2 - 1, imgs_raw * 2 - 1).mean()
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
             total_loss += loss.item()
-            total_param += param_loss.item()
-            cat_total += imgs.size(0)
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         scheduler.step()
 
-        avg_loss = total_loss / len(loader)
-        avg_param = total_param / len(loader)
-        avg_perc = total_perc / len(loader) if forward_model else 0
-        avg_cat_acc = sum(v / cat_total * 100 for v in cat_correct.values()) / len(CATEGORICAL_KEYS)
-        layer_acc = layer_count_correct / cat_total * 100
-
-        # Validation
         inverse.eval()
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                imgs_v = batch[0].to(device)
-                cont_t = batch[2].to(device)
-                cont_p, *_ = inverse(imgs_v)
-                val_loss += F.mse_loss(cont_p, cont_t).item()
+                cont_p, *_ = inverse(batch[0].to(device))
+                val_loss += F.mse_loss(cont_p, batch[2].to(device)).item()
         val_loss /= len(val_loader)
 
-        print(
-            f"[Inv] Epoch {epoch + 1}: loss={avg_loss:.4f} "
-            f"(param={avg_param:.4f}, perc={avg_perc:.4f}), "
-            f"val_mse={val_loss:.4f}, cat={avg_cat_acc:.1f}%, layers={layer_acc:.1f}%"
-        )
-
-        torch.save(
-            {"epoch": epoch, "model_state_dict": inverse.state_dict(),
-             "optimizer_state_dict": optimizer.state_dict(), "loss": avg_loss},
-            save_path,
-        )
+        print(f"[Inv] Epoch {epoch+1}: loss={total_loss/len(loader):.4f}, val_mse={val_loss:.4f}")
+        torch.save({"model_state_dict": inverse.state_dict()}, save_path)
 
     print(f"[Inverse] Done → {save_path}")
 
 
-# ============================================================================
-# CLI
-# ============================================================================
+# ── Inverse Phase 2: taste-scored fine-tuning ──
 
+class TasteFilteredDataset(Dataset):
+    """Subset of ParamsDataset filtered by taste model scores (top K%)."""
+
+    def __init__(self, data_dir, indices, transform=None, raw_transform=None):
+        full = ParamsDataset(data_dir, transform=transform, raw_transform=raw_transform)
+        self.parent = full
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.parent[self.indices[idx]]
+
+
+def _score_data_with_taste(data_dir, taste_path="models/taste_model.pt", top_pct=0.2):
+    """Score all params in data_dir with taste model, return indices of top K%."""
+    device = get_device()
+
+    if not Path(taste_path).exists():
+        print("[Finetune] No taste model found, skipping.")
+        return None
+
+    taste = TasteModel(in_dim=TASTE_FEATURE_DIM).to(device)
+    ckpt = torch.load(taste_path, map_location=device, weights_only=False)
+    taste.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+    taste.eval()
+
+    param_files = sorted((Path(data_dir) / "params").glob("*.json"))
+    if not param_files:
+        return None
+
+    scores = []
+    for pf in param_files:
+        try:
+            params = json.loads(pf.read_text())
+            params.pop("url", None)
+            feat = torch.tensor(encode_taste_features(params), dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                scores.append(torch.sigmoid(taste(feat)).item())
+        except Exception:
+            scores.append(0.0)
+
+    # Select top K%
+    n_keep = max(1, int(len(scores) * top_pct))
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    top_indices = ranked[:n_keep]
+    threshold = scores[top_indices[-1]] if top_indices else 0
+
+    print(f"[Finetune] Scored {len(scores)} samples, keeping top {n_keep} "
+          f"(threshold={threshold:.3f})")
+    return top_indices
+
+
+def finetune_inverse(
+    data_dir="data", epochs=5, lr=2e-5, save_path="models/inverse_model.pt",
+    forward_path="models/forward_model.pt", taste_path="models/taste_model.pt",
+    top_pct=0.2, perc_weight=0.5,
+):
+    """Fine-tune inverse model on taste-filtered top samples."""
+    top_indices = _score_data_with_taste(data_dir, taste_path, top_pct)
+    if top_indices is None:
+        return
+
+    batch_size = auto_batch_size(model_vram_mb=400)
+    device = get_device()
+
+    train_ds = TasteFilteredDataset(data_dir, top_indices)
+    val_size = max(1, len(train_ds) // 10)
+    train_ds_split, val_ds = random_split(train_ds, [len(train_ds) - val_size, val_size])
+
+    n_workers = auto_workers()
+    kw = dict(batch_size=batch_size, collate_fn=collate_fn, num_workers=n_workers,
+              pin_memory=device.type == "cuda", persistent_workers=True)
+    loader = DataLoader(train_ds_split, shuffle=True, **kw)
+    val_loader = DataLoader(val_ds, shuffle=False, **kw)
+    print(f"[Finetune] {len(train_ds)} samples, batch={batch_size}")
+
+    # Load Phase 1 inverse model
+    inverse = InverseModel(pretrained=False).to(device)
+    if Path(save_path).exists():
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        inverse.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        print("[Finetune] Loaded Phase 1 inverse model")
+
+    optimizer = torch.optim.AdamW([
+        {"params": inverse.backbone.parameters(), "lr": lr * 0.1},
+        {"params": [p for n, p in inverse.named_parameters()
+                   if not n.startswith("backbone")]},
+    ], lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    forward_model, lpips_fn = None, None
+    if Path(forward_path).exists():
+        forward_model = ForwardModel().to(device)
+        ckpt = torch.load(forward_path, map_location=device, weights_only=False)
+        forward_model.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        forward_model.eval()
+        for p in forward_model.parameters():
+            p.requires_grad = False
+        lpips_fn = lpips.LPIPS(net="alex", verbose=False).to(device)
+        lpips_fn.eval()
+        for p in lpips_fn.parameters():
+            p.requires_grad = False
+
+    w = {"cont": 1.0, "cat": 1.0, "bool": 0.5, "lc": 1.0,
+         "layer": 0.5, "lpres": 0.3, "lgeo": 0.3}
+
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    for epoch in range(epochs):
+        inverse.train()
+        total_loss = 0
+        pw = perc_weight
+
+        for batch in tqdm(loader, desc=f"[FT] {epoch+1}/{epochs}"):
+            (imgs, imgs_raw, cont_t, cat_t, bool_t, lc_t, lt_t, lp_t, lg_t) = batch
+            imgs, imgs_raw = imgs.to(device), imgs_raw.to(device)
+            cont_t, bool_t, lc_t = cont_t.to(device), bool_t.to(device), lc_t.to(device)
+
+            with torch.amp.autocast(device.type, enabled=use_amp):
+                (cont_p, cat_p, bool_p, lc_p, l_ps, lpr_ps, lg_ps) = inverse(imgs)
+
+                loss = w["cont"] * F.mse_loss(cont_p, cont_t)
+                for k, pred in cat_p.items():
+                    loss = loss + w["cat"] * F.cross_entropy(pred, cat_t[k].to(device))
+                loss = loss + w["bool"] * F.binary_cross_entropy_with_logits(bool_p, bool_t)
+                loss = loss + w["lc"] * F.cross_entropy(lc_p, lc_t)
+
+                for i in range(MAX_LAYERS):
+                    mask = (lc_t > i).float().unsqueeze(1)
+                    if mask.sum() == 0:
+                        continue
+                    loss = loss + w["layer"] * (((l_ps[i] - lt_t[i].to(device)) ** 2 * mask).sum() / mask.sum())
+                    loss = loss + w["lpres"] * ((F.binary_cross_entropy_with_logits(
+                        lpr_ps[i], lp_t[i].to(device), reduction="none") * mask).sum() / mask.sum())
+                    gt = lg_t[i].to(device)
+                    geo_on = lp_t[i][:, LAYER_OPTIONALS.index("geometry")].bool().to(device) & (lc_t > i).bool()
+                    if geo_on.sum() > 0:
+                        loss = loss + w["lgeo"] * F.cross_entropy(lg_ps[i][geo_on], gt[geo_on])
+
+                if forward_model is not None and pw > 0:
+                    fwd_img = forward_model(
+                        cont_p.clamp(0, 1),
+                        {k: p.argmax(1) for k, p in cat_p.items()},
+                        bool_p, lc_p.argmax(1),
+                        [lp.clamp(0, 1) for lp in l_ps],
+                        list(lpr_ps),
+                        [lg.argmax(1) for lg in lg_ps],
+                    )
+                    loss = loss + pw * lpips_fn(fwd_img * 2 - 1, imgs_raw * 2 - 1).mean()
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        inverse.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                cont_p, *_ = inverse(batch[0].to(device))
+                val_loss += F.mse_loss(cont_p, batch[2].to(device)).item()
+        val_loss /= len(val_loader)
+
+        print(f"[FT] Epoch {epoch+1}: loss={total_loss/len(loader):.4f}, val_mse={val_loss:.4f}")
+        torch.save({"model_state_dict": inverse.state_dict()}, save_path)
+
+    print(f"[Finetune] Done → {save_path}")
+
+
+# ── CLI ──
 
 def main():
-    p = argparse.ArgumentParser(description="Train forward + inverse models")
-    p.add_argument("--data", nargs="+", default=["data"], help="Data directories (multiple for cumulative)")
-    p.add_argument("--forward-only", action="store_true")
-    p.add_argument("--inverse-only", action="store_true")
-    p.add_argument("--taste-only", action="store_true", help="Train taste model (refs vs generated pool)")
+    p = argparse.ArgumentParser(description="Train models")
+    p.add_argument("--data", default="data", help="Data directory")
     p.add_argument("--forward-epochs", type=int, default=20)
     p.add_argument("--inverse-epochs", type=int, default=10)
     p.add_argument("--taste-epochs", type=int, default=12)
-    p.add_argument("--batch", type=int, default=0, help="Batch size (0=auto)")
-    p.add_argument("--lr", type=float, default=2e-4, help="LR (forward)")
-    p.add_argument("--inv-lr", type=float, default=1e-4, help="LR (inverse)")
-    p.add_argument("--taste-lr", type=float, default=3e-4, help="LR (taste)")
-    p.add_argument("--perc-weight", type=float, default=0.5, help="Perceptual loss weight")
-    p.add_argument("--freeze-backbone", type=int, default=3, help="Epochs to freeze DINOv2 backbone")
+    p.add_argument("--finetune-epochs", type=int, default=5)
+    p.add_argument("--top-pct", type=float, default=0.2, help="Top %% for taste fine-tuning")
     args = p.parse_args()
 
-    if args.taste_only:
-        print("=" * 50)
-        print("Training Taste Model")
-        print("=" * 50)
-        train_taste(
-            data_dirs=args.data,
-            epochs=args.taste_epochs,
-            batch_size=args.batch,
-            lr=args.taste_lr,
-        )
-        return
+    print("=" * 50)
+    print("Phase 1: Forward Model")
+    print("=" * 50)
+    train_forward(data_dir=args.data, epochs=args.forward_epochs)
 
-    if not args.inverse_only:
-        print("=" * 50)
-        print("Phase 1: Training Forward Model")
-        print("=" * 50)
-        train_forward(
-            data_dirs=args.data,
-            epochs=args.forward_epochs,
-            batch_size=args.batch,
-            lr=args.lr,
-        )
+    print()
+    print("=" * 50)
+    print("Phase 2: Inverse Model (coverage)")
+    print("=" * 50)
+    train_inverse(data_dir=args.data, epochs=args.inverse_epochs)
 
-    if not args.forward_only:
-        print()
-        print("=" * 50)
-        print("Phase 2: Training Inverse Model")
-        print("=" * 50)
-        train_inverse(
-            data_dirs=args.data,
-            epochs=args.inverse_epochs,
-            batch_size=args.batch,
-            lr=args.inv_lr,
-            perceptual_weight=args.perc_weight,
-            freeze_backbone=args.freeze_backbone,
-        )
+    print()
+    print("=" * 50)
+    print("Phase 3: Taste Model")
+    print("=" * 50)
+    train_taste(data_dir=args.data, epochs=args.taste_epochs)
+
+    print()
+    print("=" * 50)
+    print("Phase 4: Inverse Fine-tune (taste-filtered)")
+    print("=" * 50)
+    finetune_inverse(
+        data_dir=args.data, epochs=args.finetune_epochs, top_pct=args.top_pct,
+    )
 
 
 if __name__ == "__main__":

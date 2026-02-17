@@ -1,21 +1,14 @@
-# Art Explorer Makefile (minimal)
+# Art Explorer Makefile
 
 P := python
 N ?= 5000
-Q ?= 1000
 
 # Core workflow
 generate:
 	$(P) generate.py -n $(N)
 
-bootstrap:
-	$(P) score_refs.py
-	$(P) generate.py --scored -n $(N) --out data/quality
-
-train-super:
-	$(P) train.py --forward-only --data data
-	$(P) train.py --inverse-only --data data data/quality
-	$(P) train.py --taste-only --data data data/quality
+train:
+	$(P) train.py --data data
 
 discover:
 	$(P) predict.py --explore --mode balanced
@@ -27,24 +20,25 @@ discover-novel:
 	$(P) predict.py --explore --mode novel
 
 loop:
-	$(P) score_refs.py
-	$(P) generate.py --scored -n $(Q) --out data/quality
-	$(P) train.py --inverse-only --data data data/quality
-	$(P) train.py --taste-only --data data data/quality
+	$(P) generate.py -n $(N)
+	$(P) train.py --data data
 	$(P) predict.py --explore --mode balanced -n 20 --candidates 500
 
 # Ref curation
 save-ref:
 	$(P) save_ref.py add $(ID)
 
-save-ref-quality:
-	$(P) save_ref.py add q:$(ID)
+open-ref:
+	$(P) save_ref.py open $(ID)
 
 rm-ref:
 	$(P) save_ref.py rm $(LINE)
 
 list-refs:
 	$(P) save_ref.py list
+
+capture:
+	$(P) capture.py --line $(LINE)
 
 # Utilities
 clean:
@@ -53,17 +47,17 @@ clean:
 help:
 	@echo "Art Explorer"
 	@echo ""
-	@echo "  make generate N=5000   # coverage data (param mastery)"
-	@echo "  make bootstrap          # refs -> scored refs + quality data"
-	@echo "  make train-super        # train forward + inverse + taste"
-	@echo "  make discover           # balanced explore"
-	@echo "  make loop Q=1000        # refinement round"
+	@echo "  make generate N=5000   # coverage data"
+	@echo "  make train             # forward + inverse + taste"
+	@echo "  make discover          # balanced explore"
+	@echo "  make loop N=5000       # generate + train + discover"
 	@echo ""
 	@echo "Curation:"
+	@echo "  make save-ref ID=328"
 	@echo "  make save-ref ID=out:0"
-	@echo "  make save-ref-quality ID=123"
+	@echo "  make open-ref ID=328"
 	@echo "  make list-refs"
 	@echo "  make rm-ref LINE=3"
 
-.PHONY: generate bootstrap train-super discover discover-ref discover-novel loop \
-        save-ref save-ref-quality rm-ref list-refs clean help
+.PHONY: generate train discover discover-ref discover-novel loop \
+        save-ref open-ref rm-ref list-refs capture clean help
