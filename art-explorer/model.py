@@ -1,326 +1,244 @@
 """
-Inverse Model: image → params
-=============================
-ResNet18 backbone with multi-head output for continuous, categorical, and boolean params.
-Supports up to MAX_LAYERS layers with per-layer params.
+Forward Model (params → image) + Inverse Model (image → params)
+================================================================
+ForwardModel: differentiable renderer proxy with attention (~11M params)
+InverseModel: DINOv2-S backbone with multi-head output
 """
 
-import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import timm
 
-MAX_LAYERS = 5
+from utils import (
+    CATEGORICAL_KEYS,
+    BOOLEAN_KEYS,
+    CONTINUOUS_KEYS,
+    LAYER_CONTINUOUS_KEYS,
+    LAYER_OPTIONALS,
+    MAX_LAYERS,
+    TASTE_FEATURE_DIM,
+)
 
-# Flattened continuous params (flat keys, nested objects flattened)
-# Note: Scene.rotation/position/scale are fixed, so not predicted
-FLAT_CONTINUOUS = [
-    "repetitions",
-    "alphaFactor",
-    "scaleFactor",
-    "rotationFactor",
-    "stepFactor",
-    "xStep",
-    "yStep",
-    # Noise
-    "noiseDensity",
-    "noiseOpacity",
-    "noiseSize",
-]
+# Re-export for backward compat
+FLAT_CONTINUOUS = CONTINUOUS_KEYS
+LAYER_CONTINUOUS = LAYER_CONTINUOUS_KEYS
+CATEGORICAL = CATEGORICAL_KEYS
+BOOLEANS = BOOLEAN_KEYS
 
-# Per-layer continuous params (for each of MAX_LAYERS)
-LAYER_CONTINUOUS = [
-    "position.x",
-    "position.y",
-    "rotation",
-    "scale.x",
-    "scale.y",
-    "stepFactor",
-    "alphaFactor",
-    "scaleFactor",
-    "rotationFactor",
-]
+# ============================================================================
+# Forward Model (params → image)
+# ============================================================================
 
-# Per-layer optional params (presence predicted separately)
-LAYER_OPTIONALS = ["stepFactor", "alphaFactor", "scaleFactor", "rotationFactor", "geometry"]
-
-# Normalization ranges for continuous params (for training stability)
-CONTINUOUS_RANGES = {
-    "repetitions": (1, 500),
-    "alphaFactor": (0, 1),
-    "scaleFactor": (0, 3),
-    "rotationFactor": (-1, 1),
-    "stepFactor": (0, 2),
-    "xStep": (-3, 3),
-    "yStep": (-3, 3),
-    # Noise
-    "noiseDensity": (0, 1),
-    "noiseOpacity": (0, 1),
-    "noiseSize": (0.1, 10),
+CAT_EMBED_DIMS = {
+    "geometry": 8,
+    "scaleProgression": 4,
+    "rotationProgression": 4,
+    "alphaProgression": 3,
+    "positionProgression": 2,
+    "origin": 4,
+    "ditherType": 4,
+    "ditherMatrix": 2,
 }
 
-LAYER_RANGES = {
-    "position.x": (-2, 2),
-    "position.y": (-2, 2),
-    "rotation": (-3.14159, 3.14159),
-    "scale.x": (-2, 2),
-    "scale.y": (-2, 2),
-    "stepFactor": (0, 2),
-    "alphaFactor": (0, 1),
-    "scaleFactor": (0, 2),
-    "rotationFactor": (-1, 1),
-}
+LAYER_GEO_EMBED_DIM = 6
 
-# Categorical params
-CATEGORICAL = {
-    "geometry": [
-        "ring",
-        "bar",
-        "line",
-        "arch",
-        "u",
-        "spiral",
-        "wave",
-        "infinity",
-        "square",
-        "roundedRect",
-    ],
-    "scaleProgression": [
-        "linear",
-        "exponential",
-        "additive",
-        "fibonacci",
-        "golden",
-        "sine",
-    ],
-    "rotationProgression": ["linear", "golden-angle", "fibonacci", "sine"],
-    "alphaProgression": ["exponential", "linear", "inverse"],
-    "positionProgression": ["index", "scale"],
-    "origin": [
-        "center",
-        "top-center",
-        "bottom-center",
-        "top-left",
-        "top-right",
-        "bottom-left",
-        "bottom-right",
-    ],
-}
 
-# Booleans
-BOOLEANS = ["positionCoupled", "noiseEnabled"]
+def _forward_input_dim():
+    dim = len(CONTINUOUS_KEYS) + len(BOOLEAN_KEYS)
+    dim += sum(CAT_EMBED_DIMS.values())
+    dim += 1  # layer count
+    per_layer = len(LAYER_CONTINUOUS_KEYS) + len(LAYER_OPTIONALS) + LAYER_GEO_EMBED_DIM
+    dim += MAX_LAYERS * per_layer
+    return dim
+
+
+class SelfAttention(nn.Module):
+    """Spatial self-attention at feature map resolution."""
+
+    def __init__(self, ch):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, ch)
+        self.qkv = nn.Conv2d(ch, ch * 3, 1)
+        self.proj = nn.Conv2d(ch, ch, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        q, k, v = self.qkv(h).reshape(B, 3, C, H * W).unbind(1)
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        )
+        return x + self.proj(out.transpose(1, 2).reshape(B, C, H, W))
+
+
+class ForwardModel(nn.Module):
+    """Differentiable renderer proxy: params → 3×256×256 image.
+
+    v2: 8×8 spatial bottleneck + self-attention at 32×32. ~11M params.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.cat_embeds = nn.ModuleDict({
+            k: nn.Embedding(len(opts), CAT_EMBED_DIMS[k])
+            for k, opts in CATEGORICAL_KEYS.items()
+        })
+
+        n_geos = len(CATEGORICAL_KEYS["geometry"])
+        self.layer_geo_embeds = nn.ModuleList([
+            nn.Embedding(n_geos, LAYER_GEO_EMBED_DIM) for _ in range(MAX_LAYERS)
+        ])
+
+        input_dim = _forward_input_dim()
+
+        # MLP → 256×8×8 (4× spatial info vs v1's 4×4)
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 256 * 8 * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        # 8→16→32(+attn)→64→128→256
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 256, 4, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.attn = SelfAttention(128)  # at 32×32
+        self.decoder2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(32, 3, 4, 2, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, continuous, cat_indices, booleans, layer_count,
+                layer_continuous, layer_presence, layer_geo_indices):
+        parts = [continuous, booleans]
+        for k in CATEGORICAL_KEYS:
+            parts.append(self.cat_embeds[k](cat_indices[k]))
+        parts.append((layer_count.float() / MAX_LAYERS).unsqueeze(1))
+        for i in range(MAX_LAYERS):
+            parts.append(layer_continuous[i])
+            parts.append(layer_presence[i])
+            parts.append(self.layer_geo_embeds[i](layer_geo_indices[i]))
+
+        x = torch.cat(parts, dim=1)
+        x = self.fc(x)
+        x = x.view(-1, 256, 8, 8)
+        x = self.decoder(x)
+        x = self.attn(x)
+        return self.decoder2(x)
+
+
+# ============================================================================
+# Inverse Model (image → params)
+# ============================================================================
 
 
 class InverseModel(nn.Module):
+    """DINOv2-S backbone with multi-head output."""
+
     def __init__(self, pretrained=True):
         super().__init__()
         self.backbone = timm.create_model(
-            "resnet18", pretrained=pretrained, num_classes=0
+            "vit_small_patch14_dinov2.lvd142m",
+            pretrained=pretrained,
+            num_classes=0,
+            dynamic_img_size=True,
         )
-        feat_dim = 512
+        feat_dim = 384
 
-        # Continuous head (base params)
-        self.continuous_head = nn.Linear(feat_dim, len(FLAT_CONTINUOUS))
-
-        # Categorical heads
-        self.categorical_heads = nn.ModuleDict(
-            {k: nn.Linear(feat_dim, len(opts)) for k, opts in CATEGORICAL.items()}
-        )
-
-        # Boolean head
-        self.bool_head = nn.Linear(feat_dim, len(BOOLEANS))
-
-        # Layer count head (0-5 layers)
-        self.layer_count_head = nn.Linear(feat_dim, MAX_LAYERS + 1)
-
-        # Per-layer continuous params (all MAX_LAYERS, masked by count)
-        self.layer_heads = nn.ModuleList(
-            [nn.Linear(feat_dim, len(LAYER_CONTINUOUS)) for _ in range(MAX_LAYERS)]
+        self.continuous_head = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, len(CONTINUOUS_KEYS)),
         )
 
-        # Per-layer optional presence flags
-        self.layer_presence_heads = nn.ModuleList(
-            [nn.Linear(feat_dim, len(LAYER_OPTIONALS)) for _ in range(MAX_LAYERS)]
+        self.categorical_heads = nn.ModuleDict({
+            k: nn.Sequential(
+                nn.Linear(feat_dim, 256),
+                nn.ReLU(inplace=True),
+                nn.Linear(256, len(opts)),
+            )
+            for k, opts in CATEGORICAL_KEYS.items()
+        })
+
+        self.bool_head = nn.Sequential(
+            nn.Linear(feat_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, len(BOOLEAN_KEYS)),
         )
 
-        # Per-layer geometry (categorical)
-        n_geos = len(CATEGORICAL["geometry"])
-        self.layer_geo_heads = nn.ModuleList(
-            [nn.Linear(feat_dim, n_geos) for _ in range(MAX_LAYERS)]
+        self.layer_count_head = nn.Sequential(
+            nn.Linear(feat_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, MAX_LAYERS + 1),
         )
+
+        self.layer_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(feat_dim, 256),
+                nn.ReLU(inplace=True),
+                nn.Linear(256, len(LAYER_CONTINUOUS_KEYS)),
+            )
+            for _ in range(MAX_LAYERS)
+        ])
+
+        self.layer_presence_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(feat_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, len(LAYER_OPTIONALS)),
+            )
+            for _ in range(MAX_LAYERS)
+        ])
+
+        n_geos = len(CATEGORICAL_KEYS["geometry"])
+        self.layer_geo_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(feat_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, n_geos),
+            )
+            for _ in range(MAX_LAYERS)
+        ])
 
     def forward(self, x):
         features = self.backbone(x)
         continuous = self.continuous_head(features)
         categorical = {k: head(features) for k, head in self.categorical_heads.items()}
-        boolean = torch.sigmoid(self.bool_head(features))
+        boolean = self.bool_head(features)
         layer_count = self.layer_count_head(features)
         layer_params = [head(features) for head in self.layer_heads]
-        layer_presence = [torch.sigmoid(head(features)) for head in self.layer_presence_heads]
+        layer_presence = [head(features) for head in self.layer_presence_heads]
         layer_geos = [head(features) for head in self.layer_geo_heads]
-
         return continuous, categorical, boolean, layer_count, layer_params, layer_presence, layer_geos
 
 
-def normalize_continuous(params: dict) -> list[float]:
-    """Normalize continuous params to [0, 1] for training."""
-    values = []
+class TasteModel(nn.Module):
+    """Lightweight preference scorer: param features -> interest logit."""
 
-    for name in FLAT_CONTINUOUS:
-        v = params.get(name, 0)
-        lo, hi = CONTINUOUS_RANGES[name]
-        normalized = (v - lo) / (hi - lo) if hi > lo else 0.5
-        values.append(max(0, min(1, normalized)))
-
-    return values
-
-
-def normalize_layer(layer: dict) -> list[float]:
-    """Normalize a single layer's params to [0, 1]."""
-    values = []
-
-    for name in LAYER_CONTINUOUS:
-        if name == "position.x":
-            v = layer.get("position", {}).get("x", 0)
-        elif name == "position.y":
-            v = layer.get("position", {}).get("y", 0)
-        elif name == "scale.x":
-            v = (
-                layer.get("scale", {}).get("x", 1)
-                if isinstance(layer.get("scale"), dict)
-                else 1
-            )
-        elif name == "scale.y":
-            v = (
-                layer.get("scale", {}).get("y", 1)
-                if isinstance(layer.get("scale"), dict)
-                else 1
-            )
-        elif name == "rotation":
-            v = layer.get("rotation", 0)
-        else:
-            # Optional continuous (stepFactor, alphaFactor, etc.)
-            # Mid-range default when absent (loss masked by presence)
-            lo, hi = LAYER_RANGES[name]
-            v = layer.get(name, (lo + hi) / 2)
-
-        lo, hi = LAYER_RANGES[name]
-        normalized = (v - lo) / (hi - lo) if hi > lo else 0.5
-        values.append(max(0, min(1, normalized)))
-
-    return values
-
-
-def get_layer_presence(layer: dict) -> list[bool]:
-    """Which optional params are present in this layer."""
-    return [name in layer for name in LAYER_OPTIONALS]
-
-
-def get_layer_geometry_idx(layer: dict) -> int:
-    """Get geometry index for layer (0 if absent)."""
-    geo = layer.get("geometry")
-    if geo and geo in CATEGORICAL["geometry"]:
-        return CATEGORICAL["geometry"].index(geo)
-    return 0
-
-
-def denormalize_continuous(values: list[float]) -> dict:
-    """Denormalize [0, 1] values back to original ranges."""
-    result = {}
-
-    for i, name in enumerate(FLAT_CONTINUOUS):
-        lo, hi = CONTINUOUS_RANGES[name]
-        v = lo + values[i] * (hi - lo)
-        if name == "repetitions":
-            result[name] = round(v)
-        else:
-            result[name] = round(v, 4)
-
-    return result
-
-
-def denormalize_layer(values: list[float], presence=None, geo_idx=None) -> dict:
-    """Denormalize layer params back to original ranges."""
-    layer = {"position": {}, "scale": {}}
-    for i, name in enumerate(LAYER_CONTINUOUS):
-        lo, hi = LAYER_RANGES[name]
-        v = lo + values[i] * (hi - lo)
-        if name == "position.x":
-            layer["position"]["x"] = round(v, 4)
-        elif name == "position.y":
-            layer["position"]["y"] = round(v, 4)
-        elif name == "scale.x":
-            layer["scale"]["x"] = round(v, 4)
-        elif name == "scale.y":
-            layer["scale"]["y"] = round(v, 4)
-        elif name == "rotation":
-            layer["rotation"] = round(v, 4)
-        elif presence is not None and name in LAYER_OPTIONALS:
-            if presence[LAYER_OPTIONALS.index(name)]:
-                layer[name] = round(v, 4)
-        else:
-            layer[name] = round(v, 4)
-
-    # Per-layer geometry
-    if geo_idx is not None and presence is not None:
-        geo_i = LAYER_OPTIONALS.index("geometry")
-        if presence[geo_i]:
-            layer["geometry"] = CATEGORICAL["geometry"][geo_idx]
-
-    return layer
-
-
-def reconstruct_params(
-    continuous, categorical, boolean,
-    layer_count=None, layer_params=None,
-    layer_presence=None, layer_geos=None,
-) -> dict:
-    """Convert CNN output to flat SceneParams for API."""
-    if isinstance(continuous, torch.Tensor):
-        continuous = continuous.detach().cpu().tolist()
-    params = denormalize_continuous(continuous)
-
-    for name, logits in categorical.items():
-        idx = int(logits.argmax().item() if isinstance(logits, torch.Tensor) else logits)
-        params[name] = CATEGORICAL[name][idx]
-
-    if isinstance(boolean, torch.Tensor):
-        bool_vals = boolean.detach().cpu().tolist()
-    else:
-        bool_vals = boolean if isinstance(boolean, list) else [boolean]
-    for i, name in enumerate(BOOLEANS):
-        params[name] = bool_vals[i] > 0.5 if i < len(bool_vals) else False
-
-    params["debug"] = False
-    params["color"] = "#FFFDDD"
-    params["position"] = {"x": 0, "y": 0}
-    params["rotation"] = 0
-    params["scale"] = 1
-
-    layers = []
-    if layer_count is not None and layer_params is not None:
-        n_layers = int(
-            layer_count.argmax().item()
-            if isinstance(layer_count, torch.Tensor)
-            else layer_count
+    def __init__(self, in_dim=TASTE_FEATURE_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
         )
-        for i in range(min(n_layers, len(layer_params))):
-            lp = layer_params[i]
-            if isinstance(lp, torch.Tensor):
-                lp = lp.detach().cpu().tolist()
 
-            presence = None
-            if layer_presence is not None and i < len(layer_presence):
-                lpr = layer_presence[i]
-                if isinstance(lpr, torch.Tensor):
-                    lpr = lpr.detach().cpu().tolist()
-                presence = [v > 0.5 for v in lpr]
-
-            geo_idx = None
-            if layer_geos is not None and i < len(layer_geos):
-                lg = layer_geos[i]
-                geo_idx = int(lg.argmax().item() if isinstance(lg, torch.Tensor) else lg)
-
-            layers.append(denormalize_layer(lp, presence, geo_idx))
-
-    params["layers"] = layers
-    return params
+    def forward(self, x):
+        return self.net(x).squeeze(-1)

@@ -8,7 +8,9 @@ from utils import to_prefixed
 
 REFS_PATH = Path("references/refs.jsonl")
 DATA_DIR = Path("data/params")
+QUALITY_DIR = Path("data/quality/params")
 DATA_SCORED_DIR = Path("data-scored/params")
+OUTPUT_DIR = Path("output/params")
 
 
 def save_ref(sample_id: str):
@@ -16,23 +18,43 @@ def save_ref(sample_id: str):
 
     Supports:
       - ID (e.g., 328) → from data/params/
+      - q:ID / quality:ID (e.g., q:328) → from data/quality/params/
       - bias:ID (e.g., bias:328) → from data-scored/params/
+      - out:ID (e.g., out:0) → from output/params/
+      - out:NAME (e.g., out:ref_000) → from output/params/ by name
     """
-    # Check for bias: prefix
-    if sample_id.startswith("bias:"):
-        sample_id = sample_id[5:]  # remove "bias:"
+    if sample_id.startswith("out:"):
+        sample_id = sample_id[4:]
+        data_dir = OUTPUT_DIR
+        source = "output"
+    elif sample_id.startswith("quality:"):
+        sample_id = sample_id[8:]
+        data_dir = QUALITY_DIR
+        source = "quality"
+    elif sample_id.startswith("q:"):
+        sample_id = sample_id[2:]
+        data_dir = QUALITY_DIR
+        source = "quality"
+    elif sample_id.startswith("bias:"):
+        sample_id = sample_id[5:]
         data_dir = DATA_SCORED_DIR
         source = "data-scored"
     else:
         data_dir = DATA_DIR
         source = "data"
 
-    # Strip extension if present (e.g., 000328.png → 000328)
+    # Strip extension if present
     sample_id = sample_id.rsplit(".", 1)[0]
-    sample_id = sample_id.lstrip("0") or "0"
-    padded = f"{int(sample_id):06d}"
 
-    param_file = data_dir / f"{padded}.json"
+    # Try exact name first (for output files like "ref_000" or "explore_003")
+    param_file = data_dir / f"{sample_id}.json"
+    if not param_file.exists():
+        # Try zero-padded numeric
+        sample_id = sample_id.lstrip("0") or "0"
+        padded = f"{int(sample_id):06d}"
+        param_file = data_dir / f"{padded}.json"
+    else:
+        padded = sample_id
     if not param_file.exists():
         print(f"Not found: {param_file}")
         return

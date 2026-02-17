@@ -1,53 +1,44 @@
-# Inverse Rendering Pipeline
-# Usage: make [target]
+# Art Explorer Makefile (minimal)
 
 P := python
-N := 2000
-ITERS := 5
+N ?= 5000
+Q ?= 1000
 
-# === Pipeline ===
-all: generate train validate
-
-iterate:
-	@for i in $$(seq 1 $(ITERS)); do \
-		echo ""; \
-		echo "========== Iteration $$i/$(ITERS) =========="; \
-		echo ""; \
-		rm -rf data/ models/ validation/; \
-		$(P) generate_data.py -n $(N); \
-		$(P) train.py --epochs 10; \
-		$(P) validate.py; \
-	done
-	@echo ""
-	@echo "Done. refs.jsonl updated with good predictions."
-
-# === 1. Generate ===
+# Core workflow
 generate:
-	$(P) generate_data.py -n $(N)
+	$(P) generate.py -n $(N)
 
-generate-preview:
-	$(P) generate_data.py -n $(N) --clean --preview
+bootstrap:
+	$(P) score_refs.py
+	$(P) generate.py --scored -n $(N) --out data/quality
 
-generate-biased:
-	$(P) generate_data.py --scored -n 100
+train-super:
+	$(P) train.py --forward-only --data data
+	$(P) train.py --inverse-only --data data data/quality
+	$(P) train.py --taste-only --data data data/quality
 
-# === 2. Train ===
-train:
-	$(P) train.py --epochs 10
+discover:
+	$(P) predict.py --explore --mode balanced
 
-train-long:
-	$(P) train.py --epochs 30
+discover-ref:
+	$(P) predict.py --explore --mode ref
 
-# === 3. Validate ===
-validate:
-	$(P) validate.py
+discover-novel:
+	$(P) predict.py --explore --mode novel
 
-validate-image:
-	$(P) validate.py --image $(IMG)
+loop:
+	$(P) score_refs.py
+	$(P) generate.py --scored -n $(Q) --out data/quality
+	$(P) train.py --inverse-only --data data data/quality
+	$(P) train.py --taste-only --data data data/quality
+	$(P) predict.py --explore --mode balanced -n 20 --candidates 500
 
-# === Refs ===
+# Ref curation
 save-ref:
 	$(P) save_ref.py add $(ID)
+
+save-ref-quality:
+	$(P) save_ref.py add q:$(ID)
 
 rm-ref:
 	$(P) save_ref.py rm $(LINE)
@@ -55,53 +46,24 @@ rm-ref:
 list-refs:
 	$(P) save_ref.py list
 
-score-refs:
-	$(P) score_refs.py
+# Utilities
+clean:
+	rm -rf data/ output/ models/
 
-score-refs-fresh:
-	$(P) score_refs.py --rescore
-
-# === Clean ===
-clean-data:
-	rm -rf data/ data-scored/
-
-clean-models:
-	rm -rf models/
-
-clean-all: clean-data clean-models
-	rm -rf validation/
-
-# === Help ===
 help:
-	@echo "Inverse Rendering Pipeline"
+	@echo "Art Explorer"
 	@echo ""
-	@echo "Pipeline:   make all              # generate → train → validate"
-	@echo "            make iterate           # feedback loop (generate/train/validate × ITERS)"
-	@echo "            make iterate ITERS=10 N=1000"
+	@echo "  make generate N=5000   # coverage data (param mastery)"
+	@echo "  make bootstrap          # refs -> scored refs + quality data"
+	@echo "  make train-super        # train forward + inverse + taste"
+	@echo "  make discover           # balanced explore"
+	@echo "  make loop Q=1000        # refinement round"
 	@echo ""
-	@echo "1. Generate: make generate         # random + ref-biased pairs → data/"
-	@echo "             make generate N=5000"
-	@echo "             make generate-preview  # serial w/ preview window"
-	@echo "             make generate-biased   # VLM-weighted breeding → data-scored/"
-	@echo ""
-	@echo "2. Train:    make train            # 10 epochs"
-	@echo "             make train-long       # 30 epochs"
-	@echo ""
-	@echo "3. Validate: make validate         # predict → render → SSIM, good → refs.jsonl"
-	@echo "             make validate-image IMG=path/to/img.png"
-	@echo ""
-	@echo "Refs:        make save-ref ID=328  # add sample to refs.jsonl"
-	@echo "             make save-ref ID=bias:42  # from data-scored/"
-	@echo "             make rm-ref LINE=3    # remove by line number"
-	@echo "             make list-refs"
-	@echo "             make score-refs       # VLM rank refs (Qwen2-VL)"
-	@echo "             make score-refs-fresh # re-score all"
-	@echo ""
-	@echo "Clean:       make clean-data | clean-models | clean-all"
+	@echo "Curation:"
+	@echo "  make save-ref ID=out:0"
+	@echo "  make save-ref-quality ID=123"
+	@echo "  make list-refs"
+	@echo "  make rm-ref LINE=3"
 
-.PHONY: all iterate \
-        generate generate-preview generate-biased \
-        train train-long \
-        validate validate-image \
-        save-ref rm-ref list-refs score-refs score-refs-fresh \
-        clean-data clean-models clean-all help
+.PHONY: generate bootstrap train-super discover discover-ref discover-novel loop \
+        save-ref save-ref-quality rm-ref list-refs clean help

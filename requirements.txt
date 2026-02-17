@@ -5,8 +5,8 @@ bitsandbytes
 accelerate
 qwen-vl-utils
 
-# Inverse model (Phase 2)
-timm>=0.9.0
+# Inverse model (DINOv2-S backbone)
+timm>=0.9.2
 torchvision>=0.15.0
 
 # Optimization
@@ -25,10 +25,6 @@ lpips>=0.1.4
 
 # API calls
 requests>=2.28.0
-
-# Visualization (optional, for --preview)
-matplotlib
-PyQt6
 
 # Dev tools
 ruff
