@@ -40,6 +40,9 @@ list-refs:
 capture:
 	$(P) capture.py --line $(LINE)
 
+thumb-refs:
+	$(P) thumb_refs.py
+
 # Utilities
 clean:
 	rm -rf data/ output/ models/
@@ -58,6 +61,7 @@ help:
 	@echo "  make open-ref ID=328"
 	@echo "  make list-refs"
 	@echo "  make rm-ref LINE=3"
+	@echo "  make thumb-refs        # cache refs thumbs to data/refs/images"
 
 .PHONY: generate train discover discover-ref discover-novel loop \
-        save-ref open-ref rm-ref list-refs capture clean help
+        save-ref open-ref rm-ref list-refs capture thumb-refs clean help
