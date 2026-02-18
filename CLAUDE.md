@@ -20,7 +20,8 @@ playwright install chromium
 ## Commands (run from `art-explorer/`)
 
 ```bash
-make generate N=5000   # render refs + random/bred data → data/
+make generate N=5000   # random/bred data → data/
+make thumb-refs        # cache ref thumbnails → data/refs/images/
 make train             # forward → inverse → taste → inverse finetune
 make discover          # balanced taste + novelty explore
 make loop N=5000       # generate + train + discover
@@ -63,8 +64,10 @@ Curation (save_ref)                ←── human picks → refs.jsonl → next
 
 ```
 make generate:
-  1. Render refs as guaranteed training samples
-  2. Generate random + ref-bred data → data/
+  Generate random + ref-bred data → data/
+
+make thumb-refs:
+  Cache ref thumbnails → data/refs/images/ (content-hashed, skip existing)
 
 make train (4 phases):
   1. Forward model on all data (L1 + LPIPS)
@@ -73,11 +76,11 @@ make train (4 phases):
   4. Fine-tune inverse on taste-filtered top 20% (lower LR)
 ```
 
-All models train on the same `data/` directory. Refs are rendered into data so the inverse model directly sees curated examples. Taste model scores data to focus inverse fine-tuning on the interesting region.
+All models train on `data/`. Ref influence comes through breeding (30% of generated samples inherit from refs). Taste model scores data to focus inverse fine-tuning on the interesting region.
 
 ### Pipeline Stages
 
-1. **generate.py** - Creates (image, params) training pairs via renderer API. Renders refs first, then random + ref-bred samples.
+1. **generate.py** - Creates (image, params) training pairs via renderer API. Random + ref-bred samples (30% breeding rate).
 
 2. **model.py** - Three models:
    - **ForwardModel**: params → 3×256×256 image. Self-attention decoder. ~11M params.

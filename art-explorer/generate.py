@@ -12,7 +12,6 @@ import os
 import random
 import shutil
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -112,28 +111,6 @@ def make_params(refs, n_layers, breed_rate=0.3):
     return random_params(n_layers=layers, stratified=True)
 
 
-def _render_refs(start_idx, workers):
-    """Render each ref as a guaranteed training sample."""
-    refs = load_refs()
-    if not refs:
-        return 0
-
-    print(f"Rendering {len(refs)} refs as training samples...")
-    rendered = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [
-            ex.submit(generate_one, start_idx + i, ref)
-            for i, ref in enumerate(refs)
-        ]
-        for f in futures:
-            img, _ = f.result()
-            if img:
-                rendered += 1
-
-    print(f"Rendered {rendered}/{len(refs)} refs")
-    return len(refs)
-
-
 def generate(n=2000, n_layers=-1, workers=MAX_WORKERS):
     global _pbar
 
@@ -144,10 +121,6 @@ def generate(n=2000, n_layers=-1, workers=MAX_WORKERS):
     start_idx = len(existing)
     if start_idx > 0:
         print(f"Continuing from index {start_idx} ({start_idx} existing)")
-
-    # Render refs first as guaranteed training samples
-    ref_count = _render_refs(start_idx, workers)
-    start_idx += ref_count
 
     refs = load_refs()
     if refs:
@@ -169,7 +142,7 @@ def generate(n=2000, n_layers=-1, workers=MAX_WORKERS):
                 f.result()
         _pbar = None
 
-    print(f"Done: {ref_count} refs + {n} random = {ref_count + n} total in {DATA_DIR}/")
+    print(f"Done: {n} samples in {DATA_DIR}/")
 
 
 def main():
