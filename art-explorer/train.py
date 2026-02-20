@@ -15,7 +15,7 @@ from pathlib import Path
 import lpips
 import torch
 import torch.nn.functional as F
-from model import ForwardModel, InverseModel, MAX_LAYERS, TasteModel
+from model import ForwardModel, InverseModel, MAX_LAYERS, ParamVAE, TasteModel
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
@@ -93,6 +93,15 @@ class ParamsDataset(Dataset):
         with open(param_path) as f:
             params = json.load(f)
 
+        def _ulv(v):
+            return v["value"] if isinstance(v, dict) and "disabled" in v else v
+
+        params = {k: _ulv(v) for k, v in params.items()}
+        if "layers" in params:
+            params["layers"] = [
+                {k: _ulv(v) for k, v in la.items()} for la in params["layers"]
+            ]
+
         cont = torch.tensor(normalize_continuous(params), dtype=torch.float32)
 
         cat = {}
@@ -154,6 +163,17 @@ class TasteDataset(Dataset):
         return self.x[idx], self.y[idx]
 
 
+class FeatureDataset(Dataset):
+    def __init__(self, features):
+        self.x = torch.tensor(features, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx]
+
+
 def train_taste(data_dir="data", epochs=12, lr=3e-4, save_path="models/taste_model.pt"):
     device = get_device()
     print(f"[Taste] Device: {device}")
@@ -205,6 +225,10 @@ def train_taste(data_dir="data", epochs=12, lr=3e-4, save_path="models/taste_mod
     print(f"[Taste] {len(pos)} refs vs {len(neg)} negatives")
 
     model = TasteModel(in_dim=TASTE_FEATURE_DIM).to(device)
+    if Path(save_path).exists():
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        model.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        print(f"[Taste] Resuming from {save_path}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -247,6 +271,152 @@ def train_taste(data_dir="data", epochs=12, lr=3e-4, save_path="models/taste_mod
     print(f"[Taste] Done → {save_path}")
 
 
+def train_param_prior(
+    data_dir="data",
+    refs_path="references/refs.jsonl",
+    output_params_dir="output/params",
+    taste_path="models/taste_model.pt",
+    top_pct=0.2,
+    epochs=30,
+    lr=3e-4,
+    beta=1e-3,
+    latent_dim=64,
+    save_path="models/param_prior.pt",
+):
+    """Train VAE on taste-filtered params + heavily upweighted refs."""
+    device = get_device()
+    print(f"[Prior] Device: {device}")
+
+    # Score all data with taste, keep top K%
+    top_indices = _score_data_with_taste(data_dir, taste_path, top_pct)
+    param_files = sorted((Path(data_dir) / "params").glob("*.json"))
+
+    features = []
+    if top_indices is not None:
+        for idx in top_indices:
+            try:
+                params = json.loads(param_files[idx].read_text())
+                params.pop("url", None)
+                features.append(encode_taste_features(params))
+            except Exception:
+                continue
+        print(f"[Prior] {len(features)} taste-filtered params (top {top_pct*100:.0f}%)")
+    else:
+        for pf in param_files:
+            try:
+                params = json.loads(pf.read_text())
+                params.pop("url", None)
+                features.append(encode_taste_features(params))
+            except Exception:
+                continue
+
+    # Refs get heavy upweight (20x) — these define the target distribution
+    refs_file = Path(refs_path)
+    n_refs = 0
+    if refs_file.exists():
+        for ln in refs_file.read_text().strip().split("\n"):
+            if not ln:
+                continue
+            try:
+                f = encode_taste_features(json.loads(ln))
+                features.extend([f] * 20)
+                n_refs += 1
+            except Exception:
+                continue
+    print(f"[Prior] {n_refs} refs (20x upweight = {n_refs * 20} vectors)")
+
+    # Curated outputs get moderate upweight (5x)
+    n_out = 0
+    for pf in sorted(Path(output_params_dir).glob("*.json")):
+        try:
+            params = json.loads(pf.read_text())
+            params.pop("url", None)
+            features.extend([encode_taste_features(params)] * 5)
+            n_out += 1
+        except Exception:
+            continue
+    if n_out:
+        print(f"[Prior] {n_out} curated outputs (5x = {n_out * 5} vectors)")
+
+    if len(features) < 100:
+        print("[Prior] Not enough param data.")
+        return
+
+    dataset = FeatureDataset(features)
+    val_size = max(1, len(dataset) // 10)
+    train_ds, val_ds = random_split(dataset, [len(dataset) - val_size, val_size])
+
+    batch_size = max(128, auto_batch_size(model_vram_mb=80))
+    n_workers = auto_workers()
+    args = dict(
+        batch_size=batch_size,
+        num_workers=n_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=n_workers > 0,
+    )
+    train_loader = DataLoader(train_ds, shuffle=True, **args)
+    val_loader = DataLoader(val_ds, shuffle=False, **args)
+    print(f"[Prior] {len(features)} vectors, batch={batch_size}")
+
+    model = ParamVAE(in_dim=TASTE_FEATURE_DIM, latent_dim=latent_dim).to(device)
+    if Path(save_path).exists():
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        model.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        print(f"[Prior] Resuming from {save_path}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    best_val = float("inf")
+    eps = 1e-6
+
+    for epoch in range(epochs):
+        model.train()
+        total = 0.0
+        for x in tqdm(train_loader, desc=f"[Prior] {epoch+1}/{epochs}"):
+            x = x.to(device)
+            recon_logits, mu, logvar = model(x)
+            recon = torch.sigmoid(recon_logits)
+            rec_loss = F.binary_cross_entropy(recon.clamp(eps, 1 - eps), x, reduction="mean")
+            kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+            loss = rec_loss + beta * kl
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
+
+        scheduler.step()
+
+        model.eval()
+        val = 0.0
+        with torch.no_grad():
+            for x in val_loader:
+                x = x.to(device)
+                recon_logits, mu, logvar = model(x)
+                recon = torch.sigmoid(recon_logits)
+                rec_loss = F.binary_cross_entropy(recon.clamp(eps, 1 - eps), x, reduction="mean")
+                kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+                val += (rec_loss + beta * kl).item()
+        val /= len(val_loader)
+
+        print(f"[Prior] Epoch {epoch+1}: loss={total/len(train_loader):.4f}, val={val:.4f}")
+        if val < best_val:
+            best_val = val
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "feature_dim": TASTE_FEATURE_DIM,
+                    "latent_dim": latent_dim,
+                },
+                save_path,
+            )
+            print(f"  Saved (best={val:.4f})")
+
+    print(f"[Prior] Done → {save_path}")
+
+
 # ── Forward ──
 
 def train_forward(data_dir="data", epochs=20, lr=2e-4, save_path="models/forward_model.pt"):
@@ -271,6 +441,10 @@ def train_forward(data_dir="data", epochs=20, lr=2e-4, save_path="models/forward
     print(f"[Forward] {len(full)} samples, batch={batch_size}")
 
     model = ForwardModel().to(device)
+    if Path(save_path).exists():
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        model.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        print(f"[Forward] Resuming from {save_path}")
     if device.type == "cuda":
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -363,6 +537,10 @@ def train_inverse(
     print(f"[Inverse] {len(full)} samples, batch={batch_size}")
 
     inverse = InverseModel(pretrained=True).to(device)
+    if Path(save_path).exists():
+        ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        inverse.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        print(f"[Inverse] Resuming from {save_path}")
 
     if freeze_backbone > 0:
         for p in inverse.backbone.parameters():
@@ -659,6 +837,7 @@ def main():
     p.add_argument("--inverse-epochs", type=int, default=10)
     p.add_argument("--taste-epochs", type=int, default=12)
     p.add_argument("--finetune-epochs", type=int, default=5)
+    p.add_argument("--prior-epochs", type=int, default=30)
     p.add_argument("--top-pct", type=float, default=0.2, help="Top %% for taste fine-tuning")
     args = p.parse_args()
 
@@ -686,6 +865,12 @@ def main():
     finetune_inverse(
         data_dir=args.data, epochs=args.finetune_epochs, top_pct=args.top_pct,
     )
+
+    print()
+    print("=" * 50)
+    print("Phase 5: Param Prior (generative discover backbone)")
+    print("=" * 50)
+    train_param_prior(data_dir=args.data, epochs=args.prior_epochs)
 
 
 if __name__ == "__main__":

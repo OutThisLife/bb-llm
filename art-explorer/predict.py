@@ -2,13 +2,12 @@
 Predict: Inverse inference + gradient/CMA-ES refinement + Explore mode
 =====================================================================
 Inverse mode: target image → params (CNN + gradient descent + CMA-ES polish)
-Explore mode: breed from refs → forward-model eval → top N rendered via API
+Explore mode: sample from trained param prior → taste rerank → render top N
 """
 
 import argparse
 import io
 import json
-import math
 import os
 import random
 import threading
@@ -21,7 +20,9 @@ import numpy as np
 import requests
 import torch
 import torch.nn as nn
-from model import ForwardModel, InverseModel, MAX_LAYERS, TasteModel
+
+torch.set_float32_matmul_precision("high")
+from model import ForwardModel, InverseModel, MAX_LAYERS, ParamVAE, TasteModel
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from torchvision import transforms
@@ -35,6 +36,7 @@ from utils import (
     LAYER_OPTIONALS,
     TASTE_FEATURE_DIM,
     decode_params,
+    decode_taste_features,
     encode_taste_features,
     encode_params,
     get_device,
@@ -53,7 +55,7 @@ from utils import (
 # ============================================================================
 
 IMG_SIZE = 252  # divisible by DINOv2 patch size (14)
-FWD_SIZE = 256  # forward model output size; LPIPS needs matching spatial dims
+FWD_SIZE = 256  # forward model output size
 DEFAULT_ENDPOINT = "http://localhost:3000/api/raster"
 MAX_WORKERS = min(os.cpu_count() or 4, 12)
 OUTPUT_DIR = Path("output")
@@ -77,7 +79,6 @@ def _get_session():
 def render_api(params, endpoint=DEFAULT_ENDPOINT):
     try:
         session = _get_session()
-        # Send prefixed format — API handles Dither.*/Noise.* via isPrefixed path
         api_params = to_prefixed(params) if "layers" in params else params
         resp = session.post(endpoint, json=api_params, timeout=60)
         resp.raise_for_status()
@@ -107,20 +108,6 @@ def to_lpips_tensor(img, size=IMG_SIZE):
     return tensor * 2 - 1
 
 
-def _resolve_blend_weights(mode, w_taste=None, w_novelty=None):
-    presets = {
-        "ref": (1.0, 0.25),
-        "balanced": (0.8, 0.8),
-        "novel": (0.35, 1.0),
-    }
-    wt, wn = presets.get(mode, presets["balanced"])
-    if w_taste is not None:
-        wt = w_taste
-    if w_novelty is not None:
-        wn = w_novelty
-    return wt, wn
-
-
 def score_taste(params_list, taste_model, device):
     if taste_model is None or not params_list:
         return [0.0] * len(params_list)
@@ -141,7 +128,6 @@ def score_taste(params_list, taste_model, device):
 
 
 def _vec_to_forward_inputs(vec, categoricals, layer_geos, layer_presence, n_layers, device):
-    """Parameter vector → forward model inputs. Maintains grad through vec."""
     n_cont = len(CONTINUOUS_KEYS)
     n_bool = len(BOOLEAN_KEYS)
     n_lcont = len(LAYER_CONTINUOUS_KEYS)
@@ -178,7 +164,6 @@ def _vec_to_forward_inputs(vec, categoricals, layer_geos, layer_presence, n_laye
 
 
 def _params_to_forward_batch(flat_params_list, device):
-    """Batch of flat SceneParams dicts → forward model input tensors (no grad)."""
     batch_cont, batch_bool, batch_lc = [], [], []
     batch_cat = {k: [] for k in CATEGORICAL_KEYS}
     batch_lt = [[] for _ in range(MAX_LAYERS)]
@@ -226,7 +211,6 @@ def optimize_gradient(
     categoricals, layer_geos, layer_presence, n_layers,
     x0, steps=300, lr=0.01,
 ):
-    """Gradient descent through forward model. ~300 steps ≈ 300ms on GPU."""
     vec = nn.Parameter(torch.tensor(x0, dtype=torch.float32, device=device))
     opt = torch.optim.Adam([vec], lr=lr)
 
@@ -253,13 +237,11 @@ def optimize_gradient(
 
 
 # ============================================================================
-# Forward model scorer (GPU, ~1ms per eval)
+# Scorers (for inverse mode)
 # ============================================================================
 
 
 class ForwardScorer:
-    """Score params via forward model + LPIPS (no HTTP calls)."""
-
     def __init__(self, target_path, device, forward_model):
         self.device = device
         self.forward_model = forward_model
@@ -283,14 +265,7 @@ class ForwardScorer:
             return result.tolist()
 
 
-# ============================================================================
-# API-based scorer (fallback)
-# ============================================================================
-
-
 class APIScorer:
-    """Score params via HTTP render + LPIPS."""
-
     def __init__(self, target_path, device, endpoint=DEFAULT_ENDPOINT):
         self.device = device
         self.endpoint = endpoint
@@ -416,15 +391,11 @@ def inverse_mode(
     endpoint=DEFAULT_ENDPOINT,
     max_fevals=2000,
 ):
-    """Find params that reproduce a target image.
-
-    Flow: CNN predict → config screening → gradient descent → CMA-ES polish.
-    """
+    """CNN predict → config screening → gradient descent → CMA-ES polish."""
     print(f"\nTarget: {target_path}")
     device = get_device()
     print(f"Device: {device}")
 
-    # Load forward model
     forward_model = None
     if Path(forward_path).exists():
         forward_model = ForwardModel().to(device)
@@ -437,7 +408,6 @@ def inverse_mode(
 
     api_scorer = APIScorer(target_path, device, endpoint)
 
-    # Stage 1: Screen discrete configs
     best_params, best_score = None, float("inf")
     best_cats, best_geos, best_pres, best_nl = None, None, None, 0
     screen_fevals = 300
@@ -483,7 +453,6 @@ def inverse_mode(
         print("Optimization failed.")
         return
 
-    # Stage 2: Gradient descent through forward model (if available)
     if forward_model is not None:
         print(f"\nStage 2: Gradient refinement (300 steps)...")
         x0_grad = encode_params(best_params, best_nl)
@@ -501,14 +470,12 @@ def inverse_mode(
         x0_refine = encode_params(best_params, best_nl)
         sigma_polish = 0.1
 
-    # Stage 3: CMA-ES polish
     print(f"\nStage 3: CMA-ES polish ({max_fevals} fevals)...")
     best_params, best_score = optimize_cmaes(
         api_scorer, best_cats, best_geos, best_pres, best_nl,
         x0=x0_refine, sigma0=sigma_polish, max_fevals=max_fevals,
     )
 
-    # Final render
     rendered = render_api(best_params, endpoint)
     if rendered is None:
         print("Final API render failed.")
@@ -530,245 +497,68 @@ def inverse_mode(
 
 
 # ============================================================================
-# CLIP novelty scorer
-# ============================================================================
-
-
-class CLIPScorer:
-    """Compute novelty via CLIP embedding distance."""
-
-    def __init__(self, device):
-        from transformers import CLIPModel, CLIPProcessor
-
-        self.device = device
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16").to(device)
-        self.model.eval()
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
-        self.ref_embeds = None
-
-    def set_refs(self, ref_images):
-        """Compute and cache ref embeddings from list of PIL Images."""
-        inputs = self.processor(images=ref_images, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            self.ref_embeds = self.model.get_image_features(**inputs)
-            self.ref_embeds = nn.functional.normalize(self.ref_embeds, dim=-1)
-
-    def score_pil(self, images):
-        """Score PIL images for novelty (higher = more novel)."""
-        scores = []
-        for img in images:
-            inputs = self.processor(images=[img], return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                embed = self.model.get_image_features(**inputs)
-                embed = nn.functional.normalize(embed, dim=-1)
-                sim = (embed @ self.ref_embeds.T).squeeze(0)
-                scores.append(1.0 - sim.max().item())
-        return scores
-
-    def score_tensors(self, img_tensors):
-        """Score [0,1] image tensors for novelty (higher = more novel).
-
-        Applies CLIP preprocessing (resize 224, normalize).
-        """
-        clip_transform = transforms.Compose([
-            transforms.Resize(224),
-            transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
-                                 [0.26862954, 0.26130258, 0.27577711]),
-        ])
-        scores = []
-        with torch.no_grad():
-            for img_t in img_tensors:
-                processed = clip_transform(img_t.unsqueeze(0)).to(self.device)
-                embed = self.model.vision_model(pixel_values=processed).pooler_output
-                embed = self.model.visual_projection(embed)
-                embed = nn.functional.normalize(embed, dim=-1)
-                sim = (embed @ self.ref_embeds.T).squeeze(0)
-                scores.append(1.0 - sim.max().item())
-        return scores
-
-
-# ============================================================================
-# Explore mode
+# Explore mode (param prior sampling + taste rerank)
 # ============================================================================
 
 
 def explore_mode(
-    n_results=10,
-    n_candidates=200,
-    refs_path="references/refs.jsonl",
-    forward_path="models/forward_model.pt",
+    n_results=20,
+    n_candidates=500,
     endpoint=DEFAULT_ENDPOINT,
-    use_clip=False,
-    mode="balanced",
-    w_taste=None,
-    w_novelty=None,
     taste_path="models/taste_model.pt",
+    prior_path="models/param_prior.pt",
+    sample_temp=1.0,
 ):
-    """Discover interesting outputs via blended taste + novelty scoring."""
+    """Sample from trained param prior, rerank by taste, render top N."""
     print("\nExplore mode")
 
-    refs_file = Path(refs_path)
-    if not refs_file.exists():
-        print(f"No refs at {refs_path}")
+    if not Path(prior_path).exists():
+        print(f"No param prior at {prior_path}. Run: make train")
         return
-
-    ref_entries = [json.loads(ln) for ln in refs_file.read_text().strip().split("\n") if ln]
-    if not ref_entries:
-        print("No refs found")
-        return
-    print(f"Loaded {len(ref_entries)} refs")
 
     device = get_device()
+
+    # Load prior
+    ckpt = torch.load(prior_path, map_location=device, weights_only=False)
+    latent_dim = ckpt.get("latent_dim", 64)
+    prior = ParamVAE(in_dim=TASTE_FEATURE_DIM, latent_dim=latent_dim).to(device)
+    prior.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+    prior.eval()
+    print(f"Prior: {prior_path} (latent={latent_dim})")
+
+    # Load taste model (optional reranker)
     taste_model = None
     if Path(taste_path).exists():
         taste_model = TasteModel(in_dim=TASTE_FEATURE_DIM).to(device)
-        ckpt = torch.load(taste_path, map_location=device, weights_only=False)
-        taste_model.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
+        tckpt = torch.load(taste_path, map_location=device, weights_only=False)
+        taste_model.load_state_dict(load_state_dict_compat(tckpt["model_state_dict"]))
         taste_model.eval()
-        print(f"Taste model: {taste_path}")
+        print(f"Taste: {taste_path}")
 
-    forward_model = None
-    if Path(forward_path).exists():
-        forward_model = ForwardModel().to(device)
-        ckpt = torch.load(forward_path, map_location=device, weights_only=False)
-        forward_model.load_state_dict(load_state_dict_compat(ckpt["model_state_dict"]))
-        forward_model.eval()
-        if device.type == "cuda":
-            forward_model = torch.compile(forward_model)
-        print(f"Forward model: {forward_path}")
+    # Sample
+    print(f"Sampling {n_candidates} candidates (temp={sample_temp})...")
+    with torch.no_grad():
+        feats = prior.sample(n_candidates, device, temperature=sample_temp).cpu().tolist()
+    candidates = [decode_taste_features(f) for f in feats]
 
-    # Render ref images for diversity comparison
-    sample_refs = random.sample(ref_entries, min(20, len(ref_entries)))
-    print(f"Rendering {len(sample_refs)} ref images...")
-    ref_params_list = [to_scene_params(r) for r in sample_refs]
-    ref_images = [img for img in render_batch(ref_params_list, endpoint) if img is not None]
+    # Taste rerank
+    scores = score_taste(candidates, taste_model, device)
+    ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
 
-    if not ref_images:
-        print("Failed to render refs — is the renderer running?")
-        return
-    print(f"  {len(ref_images)} ref images rendered")
-
-    # Setup scorer
-    if use_clip:
-        print("Using CLIP for novelty scoring")
-        clip_scorer = CLIPScorer(device)
-        clip_scorer.set_refs(ref_images)
-    else:
-        lpips_model = lpips.LPIPS(net="alex", verbose=False).to(device)
-        lpips_model.eval()
-        ref_tensors = torch.stack([to_lpips_tensor(img) for img in ref_images]).to(device)
-
-    # Load scores for weighted parent selection
-    scored_path = Path("references/refs-scored.jsonl")
-    ref_weights = None
-    if scored_path.exists():
-        scored = [json.loads(ln) for ln in scored_path.read_text().strip().split("\n") if ln]
-        if scored:
-            ref_weights = [e.get("score", 0.5) for e in scored]
-            # Align weights to ref_entries length (scored may lag behind refs)
-            if len(ref_weights) < len(ref_entries):
-                ref_weights += [0.5] * (len(ref_entries) - len(ref_weights))
-            ref_weights = ref_weights[:len(ref_entries)]
-            print(f"Score-weighted parent selection ({len(scored)} scored)")
-
-    # Generate candidates by crossover breeding
-    print(f"Generating {n_candidates} candidates...")
-    candidates = []
-    for _ in range(n_candidates):
-        # 2-parent crossover 70% of the time
-        if len(ref_entries) >= 2 and random.random() < 0.7:
-            parents = random.choices(ref_entries, weights=ref_weights, k=2)
-        else:
-            parents = random.choices(ref_entries, weights=ref_weights, k=1)
-        parents = [to_scene_params(p) for p in parents]
-
-        child = dict(parents[0])
-        if len(parents) == 2:
-            for k in parents[1]:
-                if random.random() < 0.5:
-                    child[k] = parents[1][k]
-
-        for k in CATEGORICAL_KEYS:
-            if random.random() < 0.1:
-                child[k] = random.choice(CATEGORICAL_KEYS[k])
-
-        for k in CONTINUOUS_KEYS:
-            if k in child and isinstance(child[k], (int, float)):
-                child[k] = child[k] * random.uniform(0.7, 1.3)
-                if k in ("repetitions", "ditherColors"):
-                    child[k] = max(1, round(child[k]))
-
-        layers = child.get("layers", [])
-        for layer in layers:
-            for lk in ["rotation", "stepFactor", "alphaFactor", "scaleFactor", "rotationFactor"]:
-                if lk in layer and isinstance(layer[lk], (int, float)):
-                    layer[lk] = layer[lk] * random.uniform(0.7, 1.3)
-            if "position" in layer and isinstance(layer["position"], dict):
-                for axis in ("x", "y"):
-                    if axis in layer["position"]:
-                        layer["position"][axis] += random.uniform(-0.3, 0.3)
-
-        sf = child.get("scaleFactor", 1)
-        reps = child.get("repetitions", 65)
-        if isinstance(sf, (int, float)) and sf > 1.01:
-            max_reps = int(6.9 / math.log(sf))
-            child["repetitions"] = min(reps, max(10, max_reps))
-
-        candidates.append(child)
-
-    # Score candidates — novelty via CLIP/LPIPS
-    novelty_scores = []
-    batch_size = 64 if torch.cuda.is_available() else 32
-
-    if forward_model:
-        scorer_name = "CLIP" if use_clip else "LPIPS"
-        print(f"Scoring via forward model + {scorer_name}...")
-        for start in range(0, len(candidates), batch_size):
-            batch = candidates[start:start + batch_size]
-            inputs = _params_to_forward_batch(batch, device)
-            with torch.no_grad():
-                pred_imgs = forward_model(*inputs)
-                if use_clip:
-                    novelty_scores.extend(clip_scorer.score_tensors(pred_imgs))
-                else:
-                    pred_lpips = pred_imgs * 2 - 1
-                    for j in range(pred_lpips.size(0)):
-                        img_exp = pred_lpips[j].unsqueeze(0).expand(len(ref_tensors), -1, -1, -1)
-                        novelty_scores.append(lpips_model(ref_tensors, img_exp).min().item())
-    else:
-        print("Scoring via API rendering...")
-        images = render_batch(candidates, endpoint)
-        if use_clip:
-            pil_imgs = [img or Image.new("RGB", (256, 256)) for img in images]
-            novelty_scores = clip_scorer.score_pil(pil_imgs)
-        else:
-            for img in images:
-                if img is None:
-                    novelty_scores.append(0.0)
-                    continue
-                with torch.no_grad():
-                    img_t = to_lpips_tensor(img).unsqueeze(0).to(device)
-                    img_exp = img_t.expand(len(ref_tensors), -1, -1, -1)
-                    novelty_scores.append(lpips_model(ref_tensors, img_exp).min().item())
-
-    taste_scores = score_taste(candidates, taste_model, device)
-    wt, wn = _resolve_blend_weights(mode, w_taste, w_novelty)
-    if taste_model is None:
-        wt = 0.0
-    blend_scores = [
-        wt * ts + wn * ns for ts, ns in zip(taste_scores, novelty_scores, strict=True)
-    ]
-    print(f"Blend weights -> taste={wt:.2f}, novelty={wn:.2f} (mode={mode})")
-    ranked = sorted(enumerate(blend_scores), key=lambda x: -x[1])
-
+    # Render + save top N
     out_img = OUTPUT_DIR / "images"
     out_params = OUTPUT_DIR / "params"
     out_img.mkdir(parents=True, exist_ok=True)
     out_params.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nTop {n_results} results (rendering via API):")
+    existing = list(out_img.glob("*.png"))
+    start_idx = len(existing)
+    if start_idx > 0:
+        print(f"Continuing from index {start_idx}")
+
+    print(f"\nRendering top {n_results}...")
     saved = 0
-    for idx, score in ranked:
+    for idx in ranked:
         if saved >= n_results:
             break
         params = candidates[idx]
@@ -776,17 +566,15 @@ def explore_mode(
         if rendered is None:
             continue
 
-        rendered.save(out_img / f"explore_{saved:03d}.png")
-        with open(out_params / f"explore_{saved:03d}.json", "w") as f:
+        file_idx = start_idx + saved
+        rendered.save(out_img / f"{file_idx:06d}.png")
+        with open(out_params / f"{file_idx:06d}.json", "w") as f:
             json.dump(params, f)
 
-        print(
-            f"  [{saved}] score={score:.4f} taste={taste_scores[idx]:.4f} "
-            f"novelty={novelty_scores[idx]:.4f} geo={params.get('geometry', '?')}"
-        )
+        print(f"  [{file_idx}] taste={scores[idx]:.4f} geo={params.get('geometry', '?')}")
         saved += 1
 
-    print(f"\nSaved {saved} results to {OUTPUT_DIR}/")
+    print(f"\nSaved {saved} to {OUTPUT_DIR}/ ({start_idx + saved} total)")
     print("Curate with: make save-ref ID=out:0")
 
 
@@ -798,18 +586,16 @@ def explore_mode(
 def main():
     p = argparse.ArgumentParser(description="Inverse prediction + exploration")
     p.add_argument("--target", help="Target image path (inverse mode)")
-    p.add_argument("--explore", action="store_true", help="Explore/novelty mode")
-    p.add_argument("-n", type=int, default=10, help="Number of explore results")
+    p.add_argument("--explore", action="store_true", help="Explore mode")
+    p.add_argument("-n", type=int, default=20, help="Number of explore results")
     p.add_argument("--candidates", type=int, default=500, help="Explore candidate pool")
     p.add_argument("--model", default="models/inverse_model.pt")
     p.add_argument("--forward", default="models/forward_model.pt")
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     p.add_argument("--fevals", type=int, default=2000, help="CMA-ES evaluations")
-    p.add_argument("--clip", action="store_true", help="Use CLIP for novelty scoring")
-    p.add_argument("--taste", default="models/taste_model.pt", help="Taste model checkpoint path")
-    p.add_argument("--mode", choices=["ref", "balanced", "novel"], default="balanced")
-    p.add_argument("--w-taste", type=float, default=None, help="Override taste blend weight")
-    p.add_argument("--w-novelty", type=float, default=None, help="Override novelty blend weight")
+    p.add_argument("--taste", default="models/taste_model.pt")
+    p.add_argument("--prior", default="models/param_prior.pt")
+    p.add_argument("--sample-temp", type=float, default=1.0, help="Prior sample temperature")
     args = p.parse_args()
 
     if args.target:
@@ -824,13 +610,10 @@ def main():
         explore_mode(
             n_results=args.n,
             n_candidates=args.candidates,
-            forward_path=args.forward,
             endpoint=args.endpoint,
-            use_clip=args.clip,
-            mode=args.mode,
-            w_taste=args.w_taste,
-            w_novelty=args.w_novelty,
             taste_path=args.taste,
+            prior_path=args.prior,
+            sample_temp=args.sample_temp,
         )
     else:
         p.print_help()

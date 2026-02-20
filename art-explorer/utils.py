@@ -14,6 +14,7 @@ clamp = lambda v, lo, hi: max(lo, min(hi, v))
 COLORS = [
     "#FFFDDD", "#FFFEF0", "#FFFFF0", "#FFF8DC", "#FFEFD5",
     "#FFE4B5", "#F5DEB3", "#EEE8AA", "#E8D9A0", "#D4C896",
+    "#dadada", "#adadad",
 ]
 
 # ============================================================================
@@ -22,24 +23,27 @@ COLORS = [
 
 SCHEMA = {
     "Scalars.repetitions": {
-        "type": "int", "range": (1, 500), "bias_min": 15,
+        "type": "int", "range": (1, 500), "bias_min": 80,
     },
-    "Scalars.alphaFactor": {"type": "float", "range": (0, 1)},
-    "Scalars.scaleFactor": {"type": "float", "range": (0, 2)},
-    "Scalars.rotationFactor": {"type": "float", "range": (-1, 1)},
-    "Scalars.stepFactor": {"type": "float", "range": (0.02, 2)},
-    "Scalars.positionCoupled": {"type": "bool"},
+    "Scalars.alphaFactor": {"type": "float", "range": (0, 1), "power": 0.4},
+    "Scalars.scaleFactor": {"type": "float", "range": (0, 2), "center_bias": 0.8},
+    "Scalars.rotationFactor": {"type": "float", "range": (-1, 1), "center_bias": 0.8},
+    "Scalars.stepFactor": {"type": "float", "range": (0.02, 2), "power": 2.0},
+    "Scalars.positionCoupled": {"type": "bool", "prob": 0.7},
     "Scalars.scaleProgression": {
         "type": "cat",
         "options": ["linear", "exponential", "additive", "fibonacci", "golden", "sine"],
+        "weights": [1, 4, 1, 2, 2, 4],
     },
     "Scalars.rotationProgression": {
         "type": "cat",
         "options": ["linear", "golden-angle", "fibonacci", "sine"],
+        "weights": [1, 3, 2, 3],
     },
     "Scalars.alphaProgression": {
         "type": "cat",
         "options": ["exponential", "linear", "inverse"],
+        "weights": [4, 2, 1],
     },
     "Scalars.positionProgression": {"type": "cat", "options": ["index", "scale"]},
     "Spatial.xStep": {"type": "float", "range": (-2, 2), "center_bias": 0.7},
@@ -50,6 +54,7 @@ SCHEMA = {
             "center", "top-center", "bottom-center",
             "top-left", "top-right", "bottom-left", "bottom-right",
         ],
+        "weights": [6, 2, 2, 1, 1, 1, 1],
     },
     "Scene.scale": {"type": "float", "range": (0.85, 1.5)},
     "Scene.rotation": {"type": "float", "fixed": 0},
@@ -62,15 +67,18 @@ SCHEMA = {
             "ring", "bar", "line", "arch", "u",
             "spiral", "wave", "infinity", "square", "roundedRect",
         ],
+        "weights": [5, 1, 1, 2, 1, 1, 1, 5, 1, 5],
     },
-    "Element.geoWidth": {"type": "float", "range": (0.001, 0.1), "default": 0.041},
+    "Element.geoWidth": {"type": "float", "range": (0.001, 0.1), "default": 0.041, "power": 2.5},
+    "Element.startAngle": {"type": "float", "range": (-3.14159, 3.14159)},
     "Element.gradientAngle": {"type": "float", "range": (-3.14159, 3.14159)},
+    "Element.gradientRange": {"type": "interval", "range": (-1, 2), "default": [0.2, 1.0]},
     "Element.color": {"type": "color"},
-    "Noise.enabled": {"type": "bool", "prob": 0.35},
+    "Noise.enabled": {"type": "bool", "prob": 0.12},
     "Noise.density": {"type": "float", "range": (0, 1)},
     "Noise.opacity": {"type": "float", "range": (0, 0.4)},
     "Noise.size": {"type": "float", "range": (0.1, 0.5)},
-    "Dither.enabled": {"type": "bool", "prob": 0.35},
+    "Dither.enabled": {"type": "bool", "prob": 0.12},
     "Dither.type": {
         "type": "cat",
         "options": ["bayer", "noise", "halftone"],
@@ -87,18 +95,100 @@ LAYER_SCHEMA = {
     "rotation": {"type": "float", "range": (-3.14159, 3.14159)},
     "position": {"type": "obj", "axes": {"x": (-2, 2), "y": (-2, 2)}},
     "scale": {"type": "obj", "axes": {"x": (0.8, 1.2), "y": (0.8, 1.2)}},
-    "stepFactor": {"type": "float", "range": (0, 2), "optional": 0.3},
-    "alphaFactor": {"type": "float", "range": (0, 1), "optional": 0.3},
-    "scaleFactor": {"type": "float", "range": (0, 2), "optional": 0.3},
-    "rotationFactor": {"type": "float", "range": (-1, 1), "optional": 0.3},
+    "stepFactor": {"type": "float", "range": (0, 2), "optional": 0.3, "power": 2.0},
+    "alphaFactor": {"type": "float", "range": (0, 1), "optional": 0.3, "power": 0.4},
+    "scaleFactor": {"type": "float", "range": (0, 2), "optional": 0.3, "center_bias": 0.8},
+    "rotationFactor": {"type": "float", "range": (-1, 1), "optional": 0.3, "center_bias": 0.8},
     "color": {"type": "color", "optional": 0.2},
-    "geoWidth": {"type": "float", "range": (0.001, 0.1), "optional": 0.3},
+    "geoWidth": {"type": "float", "range": (0.001, 0.1), "optional": 0.3, "power": 2.5},
+    "startAngle": {"type": "float", "range": (-3.14159, 3.14159), "optional": 0.2},
     "geometry": {
         "type": "cat",
         "options": SCHEMA["Element.geometry"]["options"],
+        "weights": SCHEMA["Element.geometry"]["weights"],
         "optional": 0.4,
     },
 }
+
+# ============================================================================
+# Ref distribution analysis
+# ============================================================================
+
+
+def _extract_ref_value(v):
+    """Extract value from leva {disabled, value} or direct format."""
+    return v["value"] if isinstance(v, dict) and "value" in v else v
+
+
+def analyze_refs(refs):
+    """Derive parameter distributions from refs for biased generation.
+
+    Returns dict mapping prefixed keys to distribution specs used by random_params.
+    """
+    if not refs:
+        return {}
+
+    dist = {}
+    for pkey, spec in SCHEMA.items():
+        if "fixed" in spec:
+            continue
+        vals = [_extract_ref_value(r[pkey]) for r in refs if pkey in r]
+        if not vals:
+            continue
+        t = spec["type"]
+        if t == "cat":
+            counts = {}
+            for v in vals:
+                if v in spec["options"]:
+                    counts[v] = counts.get(v, 0) + 1
+            weights = [counts.get(o, 0) + 1 for o in spec["options"]]
+            dist[pkey] = {"type": "cat", "options": spec["options"], "weights": weights}
+        elif t == "color":
+            counts = {}
+            for v in vals:
+                if isinstance(v, str):
+                    counts[v] = counts.get(v, 0) + 1
+            all_colors = list(dict.fromkeys(COLORS + list(counts.keys())))
+            weights = [counts.get(c, 0) + 1 for c in all_colors]
+            dist[pkey] = {"type": "cat", "options": all_colors, "weights": weights}
+        elif t in ("int", "float"):
+            nums = sorted(float(v) for v in vals if isinstance(v, (int, float)))
+            if len(nums) < 3:
+                continue
+            n = len(nums)
+            p10, p90 = nums[n // 10], nums[n * 9 // 10]
+            pad = max((p90 - p10) * 0.2, 0.01)
+            lo, hi = spec["range"]
+            d = {
+                "type": "range",
+                "range": (max(lo, p10 - pad), min(hi, p90 + pad)),
+                "int": t == "int",
+            }
+            if "power" in spec:
+                d["power"] = spec["power"]
+            dist[pkey] = d
+        elif t == "bool":
+            trues = sum(1 for v in vals if v)
+            dist[pkey] = {"type": "bool", "prob": trues / len(vals)}
+
+    return dist
+
+
+def _sample_from_dist(rd):
+    """Sample a value from a ref-derived distribution."""
+    if rd["type"] == "cat":
+        return random.choices(rd["options"], weights=rd["weights"])[0]
+    if rd["type"] == "range":
+        lo, hi = rd["range"]
+        if rd.get("int"):
+            return random.randint(int(lo), int(hi))
+        if "power" in rd:
+            return round(lo + (hi - lo) * random.random() ** rd["power"], 4)
+        return round(random.uniform(lo, hi), 4)
+    if rd["type"] == "bool":
+        return random.random() < rd["prob"]
+    return None
+
 
 # ============================================================================
 # Random param generation
@@ -118,15 +208,24 @@ def _random_value(spec):
             mid = (lo + hi) / 2
             spread = (hi - lo) / 4
             return round(max(lo, min(hi, random.gauss(mid, spread))), 4)
+        if "power" in spec:
+            return round(lo + (hi - lo) * random.random() ** spec["power"], 4)
         return round(random.uniform(lo, hi), 4)
     if t == "bool":
         return random.random() < spec.get("prob", 0.5)
     if t == "cat":
+        if "weights" in spec:
+            return random.choices(spec["options"], weights=spec["weights"])[0]
         return random.choice(spec["options"])
     if t == "color":
         return random.choice(COLORS)
     if t == "obj":
         return {k: round(random.uniform(*v), 4) for k, v in spec["axes"].items()}
+    if t == "interval":
+        lo, hi = spec["range"]
+        a = round(random.uniform(lo, hi), 4)
+        b = round(random.uniform(lo, hi), 4)
+        return [min(a, b), max(a, b)]
     return None
 
 
@@ -186,37 +285,26 @@ def _mirror_layer(src, src_idx, dst_idx, axis="x"):
 _strat_counters = {}
 
 
-def random_params(n_layers=None, stratified=False):
-    """Generate prefixed params. stratified=True cycles through categorical combos."""
+def random_params(n_layers=None, stratified=False, ref_dist=None):
+    """Generate prefixed params. ref_dist biases toward ref distributions."""
     symmetric = random.random() < 0.7
+    rd = ref_dist or {}
 
     params = {}
     for name, spec in SCHEMA.items():
         if "fixed" in spec:
             params[name] = spec["fixed"]
-        elif stratified and spec["type"] == "cat":
+        elif stratified and not symmetric and spec["type"] == "cat":
             opts = spec["options"]
             idx = _strat_counters.get(name, 0)
             params[name] = opts[idx % len(opts)]
             _strat_counters[name] = idx + 1
+        elif name in rd:
+            params[name] = _sample_from_dist(rd[name])
         else:
             params[name] = _random_value(spec)
 
     if symmetric:
-        # Harmonic overrides tuned to ref distributions
-        params["Scalars.repetitions"] = random.randint(40, 250)
-        params["Scalars.scaleFactor"] = round(random.uniform(0.92, 1.08), 4)
-        params["Scalars.stepFactor"] = round(random.uniform(0.01, 0.6), 4)
-        params["Scalars.rotationFactor"] = round(random.uniform(-0.15, 0.15), 4)
-        params["Element.geometry"] = random.choices(
-            ["u", "ring", "arch", "bar", "square", "wave", "infinity", "line"],
-            weights=[27, 21, 14, 10, 10, 6, 5, 4],
-        )[0]
-        params["Scalars.rotationProgression"] = random.choices(
-            ["sine", "fibonacci", "golden-angle", "linear"],
-            weights=[53, 24, 13, 10],
-        )[0]
-
         axis = _pick_mirror_axis()
         n_pairs = (
             n_layers // 2 + 1
@@ -250,7 +338,9 @@ def random_params(n_layers=None, stratified=False):
 PREFIX_MAP = {
     "Element.geometry": "geometry",
     "Element.geoWidth": "geoWidth",
+    "Element.startAngle": "startAngle",
     "Element.gradientAngle": "gradientAngle",
+    "Element.gradientRange": "gradientRange",
     "Element.color": "color",
     "Scalars.repetitions": "repetitions",
     "Scalars.alphaFactor": "alphaFactor",
@@ -298,12 +388,17 @@ DITHER_NEST = {
 FLAT_MAP = {v: k for k, v in PREFIX_MAP.items()}
 
 
+def _ulv(v):
+    """Unwrap leva {disabled, value} wrapper."""
+    return v["value"] if isinstance(v, dict) and "disabled" in v else v
+
+
 def to_scene_params(prefixed: dict) -> dict:
     """Prefixed format → flat SceneParams (model-friendly, no dither nesting)."""
     result = {}
     for pkey, fkey in PREFIX_MAP.items():
         if pkey in prefixed:
-            result[fkey] = prefixed[pkey]
+            result[fkey] = _ulv(prefixed[pkey])
 
     layers = []
     i = 0
@@ -312,7 +407,7 @@ def to_scene_params(prefixed: dict) -> dict:
         layer_keys = {k: v for k, v in prefixed.items() if k.startswith(pre)}
         if not layer_keys:
             break
-        layers.append({k.replace(pre, ""): v for k, v in layer_keys.items()})
+        layers.append({k.replace(pre, ""): _ulv(v) for k, v in layer_keys.items()})
         i += 1
 
     result["layers"] = layers
@@ -597,6 +692,55 @@ def encode_taste_features(params: dict) -> list[float]:
             feat.extend([0.0] * geo_dim)
 
     return feat
+
+
+def decode_taste_features(feat: list[float]) -> dict:
+    """Taste feature vector -> flat SceneParams dict."""
+    i = 0
+
+    n_cont = len(CONTINUOUS_KEYS)
+    cont_vals = feat[i : i + n_cont]
+    i += n_cont
+    params = denormalize_continuous(cont_vals)
+
+    for name in BOOLEAN_KEYS:
+        params[name] = bool(feat[i] > 0.5)
+        i += 1
+
+    for key, options in CATEGORICAL_KEYS.items():
+        n = len(options)
+        logits = feat[i : i + n]
+        i += n
+        idx = max(range(n), key=lambda j: logits[j]) if n else 0
+        params[key] = options[idx]
+
+    layer_count_norm = feat[i] if i < len(feat) else 0.0
+    i += 1
+    n_layers = int(round(max(0.0, min(1.0, layer_count_norm)) * MAX_LAYERS))
+
+    geo_dim = len(CATEGORICAL_KEYS["geometry"])
+    layers = []
+    for li in range(MAX_LAYERS):
+        lvals = feat[i : i + len(LAYER_CONTINUOUS_KEYS)]
+        i += len(LAYER_CONTINUOUS_KEYS)
+
+        presence_vals = feat[i : i + len(LAYER_OPTIONALS)]
+        i += len(LAYER_OPTIONALS)
+        presence = [v > 0.5 for v in presence_vals]
+
+        geo_logits = feat[i : i + geo_dim]
+        i += geo_dim
+        geo_idx = max(range(geo_dim), key=lambda j: geo_logits[j]) if geo_dim else 0
+
+        layer = denormalize_layer(lvals, presence=presence, geo_idx=geo_idx)
+        layers.append(layer)
+
+    params["debug"] = False
+    params["color"] = "#FFFDDD"
+    params["position"] = {"x": 0, "y": 0}
+    params["rotation"] = 0
+    params["layers"] = layers[:n_layers]
+    return params
 
 
 # ============================================================================

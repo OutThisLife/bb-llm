@@ -242,3 +242,45 @@ class TasteModel(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
+
+
+class ParamVAE(nn.Module):
+    """Param-space variational autoencoder over taste feature vectors."""
+
+    def __init__(self, in_dim=TASTE_FEATURE_DIM, latent_dim=64):
+        super().__init__()
+        self.in_dim = in_dim
+        self.latent_dim = latent_dim
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+        )
+        self.mu = nn.Linear(256, latent_dim)
+        self.logvar = nn.Linear(256, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, in_dim),
+        )
+
+    def _reparam(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        h = self.encoder(x)
+        mu = self.mu(h)
+        logvar = self.logvar(h).clamp(-10, 10)
+        z = self._reparam(mu, logvar)
+        recon_logits = self.decoder(z)
+        return recon_logits, mu, logvar
+
+    def sample(self, n, device, temperature=1.0):
+        z = torch.randn(n, self.latent_dim, device=device) * max(temperature, 1e-3)
+        logits = self.decoder(z)
+        return torch.sigmoid(logits)

@@ -92,8 +92,9 @@ def list_refs():
     lines = REFS_PATH.read_text().strip().split("\n")
     for i, line in enumerate(lines, 1):
         data = json.loads(line)
-        geo = data.get("Element.geometry", "?")
-        rep = data.get("Scalars.repetitions", "?")
+        _v = lambda x: x["value"] if isinstance(x, dict) and "disabled" in x else x
+        geo = _v(data.get("Element.geometry", "?"))
+        rep = _v(data.get("Scalars.repetitions", "?"))
         print(f"{i:3d}. geo={geo}, rep={rep}")
 
 

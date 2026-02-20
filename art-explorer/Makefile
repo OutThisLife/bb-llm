@@ -7,22 +7,22 @@ N ?= 5000
 generate:
 	$(P) generate.py -n $(N)
 
+generate-figma:
+	$(P) generate.py -n $(N) --hard-figma
+
 train:
 	$(P) train.py --data data
 
 discover:
-	$(P) predict.py --explore --mode balanced
+	$(P) predict.py --explore -n 500
 
-discover-ref:
-	$(P) predict.py --explore --mode ref
-
-discover-novel:
-	$(P) predict.py --explore --mode novel
+judge:
+	$(P) judge.py -n 10 --threshold 9
 
 loop:
 	$(P) generate.py -n $(N)
 	$(P) train.py --data data
-	$(P) predict.py --explore --mode balanced -n 20 --candidates 500
+	$(P) predict.py --explore -n 20
 
 # Ref curation
 save-ref:
@@ -51,8 +51,9 @@ help:
 	@echo "Art Explorer"
 	@echo ""
 	@echo "  make generate N=5000   # coverage data"
-	@echo "  make train             # forward + inverse + taste"
-	@echo "  make discover          # balanced explore"
+	@echo "  make train             # forward + inverse + taste + param prior"
+	@echo "  make discover -n 500    # sample from prior + taste rerank"
+	@echo "  make judge             # VLM-guided reject loop (ollama)"
 	@echo "  make loop N=5000       # generate + train + discover"
 	@echo ""
 	@echo "Curation:"
@@ -61,7 +62,7 @@ help:
 	@echo "  make open-ref ID=328"
 	@echo "  make list-refs"
 	@echo "  make rm-ref LINE=3"
-	@echo "  make thumb-refs        # cache refs thumbs to data/refs/images"
+	@echo "  make thumb-refs"
 
-.PHONY: generate train discover discover-ref discover-novel loop \
+.PHONY: generate generate-figma train discover judge loop \
         save-ref open-ref rm-ref list-refs capture thumb-refs clean help
