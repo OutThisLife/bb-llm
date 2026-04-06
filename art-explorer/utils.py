@@ -1,15 +1,8 @@
-"""Shared utilities: param schema, random generation, format converters, param encoding."""
+"""Shared utilities: param schema, random generation, format converters."""
 
-import math
 import random
 
-# numpy/torch imported lazily in functions that need them
-
 clamp = lambda v, lo, hi: max(lo, min(hi, v))
-
-# ============================================================================
-# Color palette
-# ============================================================================
 
 COLORS = [
     "#FFFDDD", "#FFFEF0", "#FFFFF0", "#FFF8DC", "#FFEFD5",
@@ -17,14 +10,9 @@ COLORS = [
     "#dadada", "#adadad",
 ]
 
-# ============================================================================
-# Parameter schema (single source of truth)
-# ============================================================================
 
 SCHEMA = {
-    "Scalars.repetitions": {
-        "type": "int", "range": (1, 500), "bias_min": 80,
-    },
+    "Scalars.repetitions": {"type": "int", "range": (1, 500), "bias_min": 80},
     "Scalars.alphaFactor": {"type": "float", "range": (0, 1), "power": 0.4},
     "Scalars.scaleFactor": {"type": "float", "range": (0, 2), "center_bias": 0.8},
     "Scalars.rotationFactor": {"type": "float", "range": (-1, 1), "center_bias": 0.8},
@@ -50,23 +38,17 @@ SCHEMA = {
     "Spatial.yStep": {"type": "float", "range": (-2, 2), "center_bias": 0.7},
     "Spatial.origin": {
         "type": "cat",
-        "options": [
-            "center", "top-center", "bottom-center",
-            "top-left", "top-right", "bottom-left", "bottom-right",
-        ],
+        "options": ["center", "top-center", "bottom-center", "top-left", "top-right", "bottom-left", "bottom-right"],
         "weights": [6, 2, 2, 1, 1, 1, 1],
     },
-    "Scene.scale": {"type": "float", "range": (0.85, 1.5)},
-    "Scene.rotation": {"type": "float", "fixed": 0},
-    "Scene.position": {"type": "obj", "fixed": {"x": 0, "y": 0}},
+    "Scene.scale": {"type": "float", "range": (0.05, 2.0)},
+    "Scene.rotation": {"type": "float", "range": (-3.14159, 3.14159), "center_bias": 0.8},
+    "Scene.position": {"type": "obj", "fixed": {"x": 0, "y": -0.5}},
     "Scene.debug": {"type": "bool", "fixed": False},
     "Scene.transform": {"type": "bool", "fixed": False},
     "Element.geometry": {
         "type": "cat",
-        "options": [
-            "ring", "bar", "line", "arch", "u",
-            "spiral", "wave", "infinity", "square", "roundedRect",
-        ],
+        "options": ["ring", "bar", "line", "arch", "u", "spiral", "wave", "infinity", "square", "roundedRect"],
         "weights": [5, 1, 1, 2, 1, 1, 1, 5, 1, 5],
     },
     "Element.geoWidth": {"type": "float", "range": (0.001, 0.1), "default": 0.041, "power": 2.5},
@@ -76,25 +58,27 @@ SCHEMA = {
     "Element.color": {"type": "color"},
     "Noise.enabled": {"type": "bool", "prob": 0.12},
     "Noise.density": {"type": "float", "range": (0, 1)},
-    "Noise.opacity": {"type": "float", "range": (0, 0.4)},
-    "Noise.size": {"type": "float", "range": (0.1, 0.5)},
-    "Dither.enabled": {"type": "bool", "prob": 0.12},
-    "Dither.type": {
+    "Noise.opacity": {"type": "float", "range": (0, 0.3)},
+    "Noise.size": {"type": "float", "range": (0.1, 0.55)},
+    "CRT.enabled": {"type": "bool", "prob": 0.12},
+    "CRT.bleed": {"type": "float", "range": (0, 1)},
+    "CRT.bloom": {"type": "float", "range": (0, 1)},
+    "CRT.brightness": {"type": "float", "range": (0.5, 2)},
+    "CRT.mask": {
         "type": "cat",
-        "options": ["bayer", "noise", "halftone"],
+        "options": ["none", "shadow", "grille", "stretched", "vga"],
+        "weights": [1, 1, 5, 1, 1],
     },
-    "Dither.matrix": {"type": "cat", "options": [2, 4, 8]},
-    "Dither.colors": {"type": "int", "range": (8, 32)},
-    "Dither.strength": {"type": "float", "range": (0.2, 0.8)},
-    "Dither.scale": {"type": "float", "range": (1, 8)},
-    "Dither.bias": {"type": "float", "range": (0, 0.5)},
-    "Dither.grayscale": {"type": "bool", "prob": 0.1},
+    "CRT.maskStrength": {"type": "float", "range": (0, 1)},
+    "CRT.scale": {"type": "float", "range": (1, 8)},
+    "CRT.scanlines": {"type": "float", "range": (0, 1)},
+    "CRT.warp": {"type": "float", "range": (0, 0.1)},
 }
 
 LAYER_SCHEMA = {
     "rotation": {"type": "float", "range": (-3.14159, 3.14159)},
     "position": {"type": "obj", "axes": {"x": (-2, 2), "y": (-2, 2)}},
-    "scale": {"type": "obj", "axes": {"x": (0.8, 1.2), "y": (0.8, 1.2)}},
+    "scale": {"type": "obj", "axes": {"x": (-2, 2), "y": (-2, 2)}},
     "stepFactor": {"type": "float", "range": (0, 2), "optional": 0.3, "power": 2.0},
     "alphaFactor": {"type": "float", "range": (0, 1), "optional": 0.3, "power": 0.4},
     "scaleFactor": {"type": "float", "range": (0, 2), "optional": 0.3, "center_bias": 0.8},
@@ -110,146 +94,90 @@ LAYER_SCHEMA = {
     },
 }
 
-# ============================================================================
-# Ref distribution analysis
-# ============================================================================
 
 
-def _extract_ref_value(v):
-    """Extract value from leva {disabled, value} or direct format."""
-    return v["value"] if isinstance(v, dict) and "value" in v else v
+_strat_counters = {}
 
 
-def analyze_refs(refs):
-    """Derive parameter distributions from refs for biased generation.
-
-    Returns dict mapping prefixed keys to distribution specs used by random_params.
-    """
-    if not refs:
-        return {}
-
-    dist = {}
-    for pkey, spec in SCHEMA.items():
-        if "fixed" in spec:
-            continue
-        vals = [_extract_ref_value(r[pkey]) for r in refs if pkey in r]
-        if not vals:
-            continue
-        t = spec["type"]
-        if t == "cat":
-            counts = {}
-            for v in vals:
-                if v in spec["options"]:
-                    counts[v] = counts.get(v, 0) + 1
-            weights = [counts.get(o, 0) + 1 for o in spec["options"]]
-            dist[pkey] = {"type": "cat", "options": spec["options"], "weights": weights}
-        elif t == "color":
-            counts = {}
-            for v in vals:
-                if isinstance(v, str):
-                    counts[v] = counts.get(v, 0) + 1
-            all_colors = list(dict.fromkeys(COLORS + list(counts.keys())))
-            weights = [counts.get(c, 0) + 1 for c in all_colors]
-            dist[pkey] = {"type": "cat", "options": all_colors, "weights": weights}
-        elif t in ("int", "float"):
-            nums = sorted(float(v) for v in vals if isinstance(v, (int, float)))
-            if len(nums) < 3:
-                continue
-            n = len(nums)
-            p10, p90 = nums[n // 10], nums[n * 9 // 10]
-            pad = max((p90 - p10) * 0.2, 0.01)
-            lo, hi = spec["range"]
-            d = {
-                "type": "range",
-                "range": (max(lo, p10 - pad), min(hi, p90 + pad)),
-                "int": t == "int",
-            }
-            if "power" in spec:
-                d["power"] = spec["power"]
-            dist[pkey] = d
-        elif t == "bool":
-            trues = sum(1 for v in vals if v)
-            dist[pkey] = {"type": "bool", "prob": trues / len(vals)}
-
-    return dist
+def _strat_pick(name, options):
+    idx = _strat_counters.get(name, 0)
+    _strat_counters[name] = idx + 1
+    return options[idx % len(options)]
 
 
-def _sample_from_dist(rd):
-    """Sample a value from a ref-derived distribution."""
-    if rd["type"] == "cat":
-        return random.choices(rd["options"], weights=rd["weights"])[0]
-    if rd["type"] == "range":
-        lo, hi = rd["range"]
-        if rd.get("int"):
-            return random.randint(int(lo), int(hi))
-        if "power" in rd:
-            return round(lo + (hi - lo) * random.random() ** rd["power"], 4)
-        return round(random.uniform(lo, hi), 4)
-    if rd["type"] == "bool":
-        return random.random() < rd["prob"]
-    return None
-
-
-# ============================================================================
-# Random param generation
-# ============================================================================
+def _strat_gate(name, prob):
+    if prob >= 1:
+        return True
+    slots = max(1, min(9, int(round(prob * 10))))
+    return _strat_pick(name, [True] * slots + [False] * (10 - slots))
 
 
 def _random_value(spec):
     t = spec["type"]
+
     if t == "int":
         lo, hi = spec["range"]
         if "bias_min" in spec and random.random() < 0.8:
             return random.randint(spec["bias_min"], hi)
         return random.randint(lo, hi)
+
     if t == "float":
         lo, hi = spec["range"]
         if "center_bias" in spec and random.random() < spec["center_bias"]:
-            mid = (lo + hi) / 2
-            spread = (hi - lo) / 4
-            return round(max(lo, min(hi, random.gauss(mid, spread))), 4)
+            mid, spread = (lo + hi) / 2, (hi - lo) / 4
+            return round(clamp(random.gauss(mid, spread), lo, hi), 4)
         if "power" in spec:
             return round(lo + (hi - lo) * random.random() ** spec["power"], 4)
         return round(random.uniform(lo, hi), 4)
+
     if t == "bool":
         return random.random() < spec.get("prob", 0.5)
+
     if t == "cat":
-        if "weights" in spec:
-            return random.choices(spec["options"], weights=spec["weights"])[0]
-        return random.choice(spec["options"])
+        return random.choices(spec["options"], weights=spec.get("weights"))[0] if "weights" in spec else random.choice(spec["options"])
+
     if t == "color":
         return random.choice(COLORS)
+
     if t == "obj":
-        return {k: round(random.uniform(*v), 4) for k, v in spec["axes"].items()}
+        if "axes" in spec:
+            return {k: round(random.uniform(*v), 4) for k, v in spec["axes"].items()}
+        return None
+
     if t == "interval":
         lo, hi = spec["range"]
-        a = round(random.uniform(lo, hi), 4)
-        b = round(random.uniform(lo, hi), 4)
-        return [min(a, b), max(a, b)]
+        a, b = random.uniform(lo, hi), random.uniform(lo, hi)
+        return [round(min(a, b), 4), round(max(a, b), 4)]
+
     return None
 
 
-def random_layer(i):
-    """Generate random params for layer i."""
+def _random_layer(i, stratified=False):
     pre = f"Groups.g{i}.g{i}-"
     p = {}
+
     for name, spec in LAYER_SCHEMA.items():
         prob = spec.get("optional", 1.0)
-        if random.random() < prob:
+        include = _strat_gate(f"{pre}{name}:present", prob) if stratified else random.random() < prob
+        if not include:
+            continue
+
+        if stratified and spec["type"] == "cat":
+            val = _strat_pick(f"{pre}{name}:cat", spec["options"])
+        elif stratified and spec["type"] == "bool":
+            val = _strat_pick(f"{pre}{name}:bool", [True, False])
+        else:
             val = _random_value(spec)
-            if name == "position" and isinstance(val, dict):
-                val = {"x": clamp(val["x"], -1, 1), "y": clamp(val["y"], -1, 1)}
-            p[f"{pre}{name}"] = val
+
+        if name == "position" and isinstance(val, dict):
+            val = {"x": clamp(val["x"], -1, 1), "y": clamp(val["y"], -1, 1)}
+
+        p[f"{pre}{name}"] = val
+
     return p
 
 
-def _pick_mirror_axis():
-    """Randomly choose mirror axis: flip x, flip y, or flip both."""
-    return random.choice(["x", "y", "xy"])
-
-
 def _flip_scale(scale, axis):
-    """Negate scale on the given axis."""
     x, y = scale.get("x", 1), scale.get("y", 1)
     if "x" in axis:
         x *= -1
@@ -259,7 +187,6 @@ def _flip_scale(scale, axis):
 
 
 def _mirror_base(i, axis="x"):
-    """Fresh mirror layer: only position/rotation/scale (rest inherits from base)."""
     pre = f"Groups.g{i}.g{i}-"
     return {
         f"{pre}position": {"x": 0, "y": 0},
@@ -269,71 +196,60 @@ def _mirror_base(i, axis="x"):
 
 
 def _mirror_layer(src, src_idx, dst_idx, axis="x"):
-    """Clone src layer into dst layer index, negate scale on axis."""
     src_pre = f"Groups.g{src_idx}.g{src_idx}-"
     dst_pre = f"Groups.g{dst_idx}.g{dst_idx}-"
-    p = {}
-    for k, v in src.items():
-        if k.startswith(src_pre):
-            suffix = k[len(src_pre):]
-            p[f"{dst_pre}{suffix}"] = v
-    src_scale = src.get(f"{src_pre}scale", {"x": 1, "y": 1})
-    p[f"{dst_pre}scale"] = _flip_scale(src_scale, axis)
+    p = {f"{dst_pre}{k[len(src_pre):]}": v for k, v in src.items() if k.startswith(src_pre)}
+    p[f"{dst_pre}scale"] = _flip_scale(src.get(f"{src_pre}scale", {"x": 1, "y": 1}), axis)
     return p
 
 
-_strat_counters = {}
-
-
-def random_params(n_layers=None, stratified=False, ref_dist=None):
-    """Generate prefixed params. ref_dist biases toward ref distributions."""
-    symmetric = random.random() < 0.7
-    rd = ref_dist or {}
+def random_params(n_layers=None, stratified=False):
+    symmetric = _strat_pick("__symmetric__", [True, False]) if stratified else random.random() < 0.7
 
     params = {}
     for name, spec in SCHEMA.items():
         if "fixed" in spec:
             params[name] = spec["fixed"]
-        elif stratified and not symmetric and spec["type"] == "cat":
-            opts = spec["options"]
-            idx = _strat_counters.get(name, 0)
-            params[name] = opts[idx % len(opts)]
-            _strat_counters[name] = idx + 1
-        elif name in rd:
-            params[name] = _sample_from_dist(rd[name])
+        elif stratified and spec["type"] == "cat":
+            params[name] = _strat_pick(name, spec["options"])
+        elif stratified and spec["type"] == "bool":
+            params[name] = _strat_pick(name, [True, False])
         else:
             params[name] = _random_value(spec)
 
     if symmetric:
-        axis = _pick_mirror_axis()
-        n_pairs = (
-            n_layers // 2 + 1
-            if n_layers is not None
-            else random.choice([1, 2, 3])
-        )
-        if n_pairs >= 1:
+        axis = _strat_pick("__mirror_axis__", ["x", "y", "xy"]) if stratified else random.choice(["x", "y", "xy"])
+
+        if n_layers is not None:
+            use_center, n_pairs = True, n_layers // 2 + 1
+        elif stratified:
+            use_center = _strat_pick("__sym_center__", [True, False])
+            n_pairs = _strat_pick("__n_pairs__", [1, 2, 3] if use_center else [1, 2])
+        else:
+            use_center, n_pairs = True, random.choice([1, 2, 3])
+
+        if use_center and n_pairs >= 1:
             params.update(_mirror_base(0, axis))
-        for pair in range(1, n_pairs):
-            orig_idx = pair * 2 - 1
-            mirror_idx = pair * 2
-            orig = random_layer(orig_idx)
+
+        start = 1 if use_center else 0
+        for pair in range(start, n_pairs):
+            oi = pair * 2 - 1 if use_center else pair * 2
+            mi = pair * 2 if use_center else pair * 2 + 1
+            orig = _random_layer(oi, stratified=stratified)
             params.update(orig)
-            params.update(_mirror_layer(orig, orig_idx, mirror_idx, axis))
+            params.update(_mirror_layer(orig, oi, mi, axis))
     else:
         n = (
-            n_layers
-            if n_layers is not None
-            else random.choices(range(0, 6), weights=[3, 4, 3, 2, 1, 1])[0]
+            n_layers if n_layers is not None
+            else _strat_pick("__layer_count__", [0, 1, 2, 3, 4, 5]) if stratified
+            else random.choices(range(6), weights=[3, 4, 3, 2, 1, 1])[0]
         )
         for i in range(n):
-            params.update(random_layer(i))
+            params.update(_random_layer(i, stratified=stratified))
 
     return params
 
 
-# ============================================================================
-# Format converters (prefixed ↔ flat)
-# ============================================================================
 
 PREFIX_MAP = {
     "Element.geometry": "geometry",
@@ -363,51 +279,34 @@ PREFIX_MAP = {
     "Noise.density": "noiseDensity",
     "Noise.opacity": "noiseOpacity",
     "Noise.size": "noiseSize",
-    "Dither.enabled": "ditherEnabled",
-    "Dither.type": "ditherType",
-    "Dither.matrix": "ditherMatrix",
-    "Dither.colors": "ditherColors",
-    "Dither.strength": "ditherStrength",
-    "Dither.scale": "ditherScale",
-    "Dither.bias": "ditherBias",
-    "Dither.grayscale": "ditherGrayscale",
-}
-
-# Flat dither keys → nested dither object keys (for API SceneParams)
-DITHER_NEST = {
-    "ditherEnabled": "enabled",
-    "ditherType": "type",
-    "ditherMatrix": "matrix",
-    "ditherColors": "colors",
-    "ditherStrength": "strength",
-    "ditherScale": "scale",
-    "ditherBias": "bias",
-    "ditherGrayscale": "grayscale",
+    "CRT.enabled": "crtEnabled",
+    "CRT.bleed": "crtBleed",
+    "CRT.bloom": "crtBloom",
+    "CRT.brightness": "crtBrightness",
+    "CRT.mask": "crtMask",
+    "CRT.maskStrength": "crtMaskStrength",
+    "CRT.scale": "crtScale",
+    "CRT.scanlines": "crtScanlines",
+    "CRT.warp": "crtWarp",
 }
 
 FLAT_MAP = {v: k for k, v in PREFIX_MAP.items()}
 
 
 def _ulv(v):
-    """Unwrap leva {disabled, value} wrapper."""
     return v["value"] if isinstance(v, dict) and "disabled" in v else v
 
 
 def to_scene_params(prefixed: dict) -> dict:
-    """Prefixed format → flat SceneParams (model-friendly, no dither nesting)."""
-    result = {}
-    for pkey, fkey in PREFIX_MAP.items():
-        if pkey in prefixed:
-            result[fkey] = _ulv(prefixed[pkey])
+    result = {fkey: _ulv(prefixed[pkey]) for pkey, fkey in PREFIX_MAP.items() if pkey in prefixed}
 
-    layers = []
-    i = 0
+    layers, i = [], 0
     while True:
         pre = f"Groups.g{i}.g{i}-"
-        layer_keys = {k: v for k, v in prefixed.items() if k.startswith(pre)}
-        if not layer_keys:
+        lk = {k: v for k, v in prefixed.items() if k.startswith(pre)}
+        if not lk:
             break
-        layers.append({k.replace(pre, ""): _ulv(v) for k, v in layer_keys.items()})
+        layers.append({k.replace(pre, ""): _ulv(v) for k, v in lk.items()})
         i += 1
 
     result["layers"] = layers
@@ -415,18 +314,7 @@ def to_scene_params(prefixed: dict) -> dict:
 
 
 def to_prefixed(flat: dict) -> dict:
-    """Flat SceneParams → prefixed format."""
-    result = {}
-    for fkey, pkey in FLAT_MAP.items():
-        if fkey in flat and fkey != "layers":
-            result[pkey] = flat[fkey]
-
-    # Extract nested dither → prefixed keys
-    if "dither" in flat:
-        for flat_key, nested_key in DITHER_NEST.items():
-            pkey = FLAT_MAP.get(flat_key)
-            if pkey and nested_key in flat["dither"]:
-                result[pkey] = flat["dither"][nested_key]
+    result = {pkey: flat[fkey] for fkey, pkey in FLAT_MAP.items() if fkey in flat and fkey != "layers"}
 
     for i, layer in enumerate(flat.get("layers", [])):
         pre = f"Groups.g{i}.g{i}-"
@@ -436,150 +324,84 @@ def to_prefixed(flat: dict) -> dict:
     return result
 
 
-# ============================================================================
-# Derived constants (from SCHEMA — single source of truth)
-# ============================================================================
 
 MAX_LAYERS = 5
 
-# Continuous params predicted by models (flat keys, nested objects flattened)
 CONTINUOUS_KEYS = [
-    "repetitions",
-    "alphaFactor",
-    "scaleFactor",
-    "rotationFactor",
-    "stepFactor",
-    "xStep",
-    "yStep",
-    "scale",
-    "geoWidth",
-    "gradientAngle",
-    "noiseDensity",
-    "noiseOpacity",
-    "noiseSize",
-    "ditherColors",
-    "ditherStrength",
-    "ditherScale",
-    "ditherBias",
+    "repetitions", "alphaFactor", "scaleFactor", "rotationFactor", "stepFactor",
+    "xStep", "yStep", "scale", "rotation", "geoWidth", "startAngle",
+    "gradientAngle", "gradientRangeMin", "gradientRangeMax",
+    "noiseDensity", "noiseOpacity", "noiseSize",
+    "crtBleed", "crtBloom", "crtBrightness", "crtMaskStrength", "crtScale", "crtScanlines", "crtWarp",
 ]
 
 CONTINUOUS_RANGES = {
-    "repetitions": (1, 500),
-    "alphaFactor": (0, 1),
-    "scaleFactor": (0, 3),
-    "rotationFactor": (-1, 1),
-    "stepFactor": (0, 2),
-    "xStep": (-3, 3),
-    "yStep": (-3, 3),
-    "scale": (0.85, 1.5),
-    "geoWidth": (0.001, 0.1),
-    "gradientAngle": (-3.14159, 3.14159),
-    "noiseDensity": (0, 1),
-    "noiseOpacity": (0, 0.3),
-    "noiseSize": (0.1, 0.55),
-    "ditherColors": (8, 32),
-    "ditherStrength": (0.2, 0.8),
-    "ditherScale": (1, 8),
-    "ditherBias": (0, 0.5),
+    "repetitions": (1, 500), "alphaFactor": (0, 1), "scaleFactor": (0, 2),
+    "rotationFactor": (-1, 1), "stepFactor": (0, 2), "xStep": (-2, 2), "yStep": (-2, 2),
+    "scale": (0.05, 2.0), "rotation": (-3.14159, 3.14159), "geoWidth": (0.001, 0.1),
+    "startAngle": (-3.14159, 3.14159), "gradientAngle": (-3.14159, 3.14159),
+    "gradientRangeMin": (-1, 2), "gradientRangeMax": (-1, 2),
+    "noiseDensity": (0, 1), "noiseOpacity": (0, 0.3), "noiseSize": (0.1, 0.55),
+    "crtBleed": (0, 1), "crtBloom": (0, 1), "crtBrightness": (0.5, 2),
+    "crtMaskStrength": (0, 1), "crtScale": (1, 8), "crtScanlines": (0, 1), "crtWarp": (0, 0.1),
 }
 
-# Per-layer continuous params (for each of MAX_LAYERS)
 LAYER_CONTINUOUS_KEYS = [
-    "position.x",
-    "position.y",
-    "rotation",
-    "scale.x",
-    "scale.y",
-    "stepFactor",
-    "alphaFactor",
-    "scaleFactor",
-    "rotationFactor",
-    "geoWidth",
+    "position.x", "position.y", "rotation", "scale.x", "scale.y",
+    "stepFactor", "alphaFactor", "scaleFactor", "rotationFactor", "geoWidth", "startAngle",
 ]
 
 LAYER_RANGES = {
-    "position.x": (-2, 2),
-    "position.y": (-2, 2),
-    "rotation": (-3.14159, 3.14159),
-    "scale.x": (-2, 2),
-    "scale.y": (-2, 2),
-    "stepFactor": (0, 2),
-    "alphaFactor": (0, 1),
-    "scaleFactor": (0, 2),
-    "rotationFactor": (-1, 1),
-    "geoWidth": (0.001, 0.1),
+    "position.x": (-2, 2), "position.y": (-2, 2), "rotation": (-3.14159, 3.14159),
+    "scale.x": (-2, 2), "scale.y": (-2, 2), "stepFactor": (0, 2),
+    "alphaFactor": (0, 1), "scaleFactor": (0, 2), "rotationFactor": (-1, 1),
+    "geoWidth": (0.001, 0.1), "startAngle": (-3.14159, 3.14159),
 }
 
-# Per-layer optional params (presence predicted separately)
-LAYER_OPTIONALS = ["stepFactor", "alphaFactor", "scaleFactor", "rotationFactor", "geoWidth", "geometry"]
+LAYER_OPTIONALS = ["stepFactor", "alphaFactor", "scaleFactor", "rotationFactor", "geoWidth", "startAngle", "geometry"]
 
-# Categorical params with their options
 CATEGORICAL_KEYS = {
-    "geometry": [
-        "ring", "bar", "line", "arch", "u",
-        "spiral", "wave", "infinity", "square", "roundedRect",
-    ],
-    "scaleProgression": [
-        "linear", "exponential", "additive", "fibonacci", "golden", "sine",
-    ],
+    "geometry": ["ring", "bar", "line", "arch", "u", "spiral", "wave", "infinity", "square", "roundedRect"],
+    "scaleProgression": ["linear", "exponential", "additive", "fibonacci", "golden", "sine"],
     "rotationProgression": ["linear", "golden-angle", "fibonacci", "sine"],
     "alphaProgression": ["exponential", "linear", "inverse"],
     "positionProgression": ["index", "scale"],
-    "origin": [
-        "center", "top-center", "bottom-center",
-        "top-left", "top-right", "bottom-left", "bottom-right",
-    ],
-    "ditherType": ["bayer", "noise", "halftone"],
-    "ditherMatrix": [2, 4, 8],
+    "origin": ["center", "top-center", "bottom-center", "top-left", "top-right", "bottom-left", "bottom-right"],
+    "crtMask": ["none", "shadow", "grille", "stretched", "vga"],
 }
 
-# Booleans
-BOOLEAN_KEYS = ["positionCoupled", "noiseEnabled", "ditherEnabled", "ditherGrayscale"]
-TASTE_FEATURE_DIM = (
-    len(CONTINUOUS_KEYS)
-    + len(BOOLEAN_KEYS)
-    + sum(len(v) for v in CATEGORICAL_KEYS.values())
-    + 1  # layer count
-    + MAX_LAYERS
-    * (
-        len(LAYER_CONTINUOUS_KEYS)
-        + len(LAYER_OPTIONALS)
-        + len(CATEGORICAL_KEYS["geometry"])
-    )
-)
+BOOLEAN_KEYS = ["positionCoupled", "noiseEnabled", "crtEnabled"]
 
-
-# ============================================================================
-# Normalization helpers
-# ============================================================================
 
 
 def normalize_continuous(params: dict) -> list[float]:
-    """Normalize continuous params to [0, 1] for training."""
     values = []
     for name in CONTINUOUS_KEYS:
-        v = params.get(name, 0)
+        if name == "gradientRangeMin":
+            gr = params.get("gradientRange", [0.2, 1.0])
+            v = gr[0] if isinstance(gr, (list, tuple)) and len(gr) >= 1 else 0.2
+        elif name == "gradientRangeMax":
+            gr = params.get("gradientRange", [0.2, 1.0])
+            v = gr[1] if isinstance(gr, (list, tuple)) and len(gr) >= 2 else 1.0
+        else:
+            v = params.get(name, 0)
         lo, hi = CONTINUOUS_RANGES[name]
-        normalized = (v - lo) / (hi - lo) if hi > lo else 0.5
-        values.append(max(0, min(1, normalized)))
+        values.append(clamp((v - lo) / (hi - lo) if hi > lo else 0.5, 0, 1))
     return values
 
 
 def denormalize_continuous(values: list[float]) -> dict:
-    """Denormalize [0, 1] values back to original ranges."""
     result = {}
     for i, name in enumerate(CONTINUOUS_KEYS):
         lo, hi = CONTINUOUS_RANGES[name]
         v = lo + values[i] * (hi - lo)
-        if name in ("repetitions", "ditherColors"):
-            result[name] = round(v)
-        else:
-            result[name] = round(v, 4)
+        result[name] = round(v) if name == "repetitions" else round(v, 4)
+
+    result["gradientRange"] = [result.pop("gradientRangeMin", 0.2), result.pop("gradientRangeMax", 1.0)]
     return result
 
 
 def normalize_layer(layer: dict) -> list[float]:
-    """Normalize a single layer's params to [0, 1]."""
     values = []
     for name in LAYER_CONTINUOUS_KEYS:
         if name == "position.x":
@@ -587,34 +409,26 @@ def normalize_layer(layer: dict) -> list[float]:
         elif name == "position.y":
             v = layer.get("position", {}).get("y", 0)
         elif name == "scale.x":
-            v = (
-                layer.get("scale", {}).get("x", 1)
-                if isinstance(layer.get("scale"), dict)
-                else 1
-            )
+            v = layer.get("scale", {}).get("x", 1) if isinstance(layer.get("scale"), dict) else 1
         elif name == "scale.y":
-            v = (
-                layer.get("scale", {}).get("y", 1)
-                if isinstance(layer.get("scale"), dict)
-                else 1
-            )
+            v = layer.get("scale", {}).get("y", 1) if isinstance(layer.get("scale"), dict) else 1
         elif name == "rotation":
             v = layer.get("rotation", 0)
         else:
             lo, hi = LAYER_RANGES[name]
             v = layer.get(name, (lo + hi) / 2)
         lo, hi = LAYER_RANGES[name]
-        normalized = (v - lo) / (hi - lo) if hi > lo else 0.5
-        values.append(max(0, min(1, normalized)))
+        values.append(clamp((v - lo) / (hi - lo) if hi > lo else 0.5, 0, 1))
     return values
 
 
 def denormalize_layer(values: list[float], presence=None, geo_idx=None) -> dict:
-    """Denormalize layer params back to original ranges."""
     layer = {"position": {}, "scale": {}}
+
     for i, name in enumerate(LAYER_CONTINUOUS_KEYS):
         lo, hi = LAYER_RANGES[name]
         v = lo + values[i] * (hi - lo)
+
         if name == "position.x":
             layer["position"]["x"] = round(v, 4)
         elif name == "position.y":
@@ -632,268 +446,55 @@ def denormalize_layer(values: list[float], presence=None, geo_idx=None) -> dict:
             layer[name] = round(v, 4)
 
     if geo_idx is not None and presence is not None:
-        geo_i = LAYER_OPTIONALS.index("geometry")
-        if presence[geo_i]:
+        gi = LAYER_OPTIONALS.index("geometry")
+        if presence[gi]:
             layer["geometry"] = CATEGORICAL_KEYS["geometry"][geo_idx]
 
     return layer
 
 
-def get_layer_presence(layer: dict) -> list[bool]:
-    """Which optional params are present in this layer."""
-    return [name in layer for name in LAYER_OPTIONALS]
-
-
-def get_layer_geometry_idx(layer: dict) -> int:
-    """Get geometry index for layer (0 if absent)."""
-    geo = layer.get("geometry")
-    if geo and geo in CATEGORICAL_KEYS["geometry"]:
-        return CATEGORICAL_KEYS["geometry"].index(geo)
-    return 0
-
-
-def _one_hot(index: int, size: int) -> list[float]:
-    vec = [0.0] * size
-    if 0 <= index < size:
-        vec[index] = 1.0
-    return vec
-
-
-def encode_taste_features(params: dict) -> list[float]:
-    """Flat/prefixed params -> fixed-length taste feature vector."""
-    flat = (
-        to_scene_params(params)
-        if "Scalars.repetitions" in params or "Element.geometry" in params
-        else params
-    )
-    feat = []
-
-    feat.extend(normalize_continuous(flat))
-    feat.extend(1.0 if flat.get(k, False) else 0.0 for k in BOOLEAN_KEYS)
-
-    for key, options in CATEGORICAL_KEYS.items():
-        val = flat.get(key)
-        idx = options.index(val) if val in options else -1
-        feat.extend(_one_hot(idx, len(options)))
-
-    layers = flat.get("layers", [])
-    feat.append(min(len(layers), MAX_LAYERS) / MAX_LAYERS)
-
-    geo_dim = len(CATEGORICAL_KEYS["geometry"])
-    for i in range(MAX_LAYERS):
-        if i < len(layers):
-            layer = layers[i]
-            feat.extend(normalize_layer(layer))
-            feat.extend(1.0 if p else 0.0 for p in get_layer_presence(layer))
-            feat.extend(_one_hot(get_layer_geometry_idx(layer), geo_dim))
-        else:
-            feat.extend([0.5] * len(LAYER_CONTINUOUS_KEYS))
-            feat.extend([0.0] * len(LAYER_OPTIONALS))
-            feat.extend([0.0] * geo_dim)
-
-    return feat
-
-
-def decode_taste_features(feat: list[float]) -> dict:
-    """Taste feature vector -> flat SceneParams dict."""
-    i = 0
-
-    n_cont = len(CONTINUOUS_KEYS)
-    cont_vals = feat[i : i + n_cont]
-    i += n_cont
-    params = denormalize_continuous(cont_vals)
-
-    for name in BOOLEAN_KEYS:
-        params[name] = bool(feat[i] > 0.5)
-        i += 1
-
-    for key, options in CATEGORICAL_KEYS.items():
-        n = len(options)
-        logits = feat[i : i + n]
-        i += n
-        idx = max(range(n), key=lambda j: logits[j]) if n else 0
-        params[key] = options[idx]
-
-    layer_count_norm = feat[i] if i < len(feat) else 0.0
-    i += 1
-    n_layers = int(round(max(0.0, min(1.0, layer_count_norm)) * MAX_LAYERS))
-
-    geo_dim = len(CATEGORICAL_KEYS["geometry"])
-    layers = []
-    for li in range(MAX_LAYERS):
-        lvals = feat[i : i + len(LAYER_CONTINUOUS_KEYS)]
-        i += len(LAYER_CONTINUOUS_KEYS)
-
-        presence_vals = feat[i : i + len(LAYER_OPTIONALS)]
-        i += len(LAYER_OPTIONALS)
-        presence = [v > 0.5 for v in presence_vals]
-
-        geo_logits = feat[i : i + geo_dim]
-        i += geo_dim
-        geo_idx = max(range(geo_dim), key=lambda j: geo_logits[j]) if geo_dim else 0
-
-        layer = denormalize_layer(lvals, presence=presence, geo_idx=geo_idx)
-        layers.append(layer)
-
-    params["debug"] = False
-    params["color"] = "#FFFDDD"
-    params["position"] = {"x": 0, "y": 0}
-    params["rotation"] = 0
-    params["layers"] = layers[:n_layers]
-    return params
-
-
-# ============================================================================
-# Param vector encoding/decoding (for CMA-ES and forward model)
-# ============================================================================
-
 
 def encode_params(flat_params: dict, n_layers: int):
-    """Flat SceneParams → [0,1] normalized vector.
-
-    Layout: [continuous(10) | booleans(2) | layer_0(9) | ... | layer_n(9)]
-    """
     import numpy as np
 
-    vec = []
-
-    # Base continuous
-    for name in CONTINUOUS_KEYS:
-        v = flat_params.get(name, 0)
-        lo, hi = CONTINUOUS_RANGES[name]
-        vec.append(np.clip((v - lo) / (hi - lo), 0, 1))
-
-    # Booleans as float
+    vec = list(normalize_continuous(flat_params))
     for name in BOOLEAN_KEYS:
         vec.append(1.0 if flat_params.get(name, False) else 0.0)
 
-    # Per-layer continuous
-    layers = flat_params.get("layers", [])
     for i in range(n_layers):
-        if i < len(layers):
-            vec.extend(normalize_layer(layers[i]))
-        else:
-            vec.extend([0.5] * len(LAYER_CONTINUOUS_KEYS))
+        layers = flat_params.get("layers", [])
+        vec.extend(normalize_layer(layers[i]) if i < len(layers) else [0.5] * len(LAYER_CONTINUOUS_KEYS))
 
     return np.array(vec, dtype=np.float64)
 
 
-def decode_params(
-    vec,
-    categoricals: dict,
-    layer_geos: list,
-    layer_presence: list,
-    n_layers: int,
-) -> dict:
-    """[0,1] vector → flat SceneParams for API.
+def decode_params(vec, categoricals: dict, layer_geos: list, layer_presence: list, n_layers: int) -> dict:
+    params = denormalize_continuous(vec[: len(CONTINUOUS_KEYS)].tolist())
+    params.update(categoricals)
 
-    Inverse of encode_params. Categoricals, layer geos, and presence flags
-    are passed separately (they're discrete, not in the continuous vector).
-    """
-    # Base continuous
-    base_vals = vec[: len(CONTINUOUS_KEYS)].tolist()
-    params = denormalize_continuous(base_vals)
-
-    # Categoricals (fixed, not from vector)
-    for k, v in categoricals.items():
-        params[k] = v
-
-    # Booleans
-    bool_offset = len(CONTINUOUS_KEYS)
+    bo = len(CONTINUOUS_KEYS)
     for i, name in enumerate(BOOLEAN_KEYS):
-        params[name] = bool(vec[bool_offset + i] > 0.5)
+        params[name] = bool(vec[bo + i] > 0.5)
 
-    # Fixed fields
     params["debug"] = False
-    params["color"] = "#FFFDDD"
-    params["position"] = {"x": 0, "y": 0}
-    params["rotation"] = 0
+    params["color"] = "#efeddb"
+    params["position"] = {"x": 0, "y": -0.5}
 
-    # Layers
+    lo = bo + len(BOOLEAN_KEYS)
+    nd = len(LAYER_CONTINUOUS_KEYS)
     layers = []
-    layer_offset = bool_offset + len(BOOLEAN_KEYS)
-    n_layer_dims = len(LAYER_CONTINUOUS_KEYS)
     for i in range(n_layers):
-        lv = vec[layer_offset + i * n_layer_dims : layer_offset + (i + 1) * n_layer_dims].tolist()
-        geo_idx = None
-        if i < len(layer_geos) and layer_geos[i] is not None:
+        lv = vec[lo + i * nd : lo + (i + 1) * nd].tolist()
+        gi = None
+        if i < len(layer_geos) and layer_geos[i]:
             geos = CATEGORICAL_KEYS["geometry"]
-            geo_idx = geos.index(layer_geos[i]) if layer_geos[i] in geos else 0
-        presence = layer_presence[i] if i < len(layer_presence) else None
-        layers.append(denormalize_layer(lv, presence, geo_idx))
+            gi = geos.index(layer_geos[i]) if layer_geos[i] in geos else 0
+        pr = layer_presence[i] if i < len(layer_presence) else None
+        layers.append(denormalize_layer(lv, pr, gi))
 
     params["layers"] = layers
     return params
 
-
-def reconstruct_params(
-    continuous, categorical, boolean,
-    layer_count=None, layer_params=None,
-    layer_presence=None, layer_geos=None,
-) -> dict:
-    """Convert CNN output tensors to flat SceneParams for API."""
-    import torch
-
-    if isinstance(continuous, torch.Tensor):
-        continuous = continuous.detach().cpu().tolist()
-    params = denormalize_continuous(continuous)
-
-    for name, logits in categorical.items():
-        idx = int(logits.argmax().item() if isinstance(logits, torch.Tensor) else logits)
-        params[name] = CATEGORICAL_KEYS[name][idx]
-
-    if isinstance(boolean, torch.Tensor):
-        bool_vals = boolean.detach().cpu().tolist()
-    else:
-        bool_vals = boolean if isinstance(boolean, list) else [boolean]
-    for i, name in enumerate(BOOLEAN_KEYS):
-        params[name] = bool_vals[i] > 0.0 if i < len(bool_vals) else False
-
-    params["debug"] = False
-    params["color"] = "#FFFDDD"
-    params["position"] = {"x": 0, "y": 0}
-    params["rotation"] = 0
-
-    layers = []
-    if layer_count is not None and layer_params is not None:
-        n_layers = int(
-            layer_count.argmax().item()
-            if isinstance(layer_count, torch.Tensor)
-            else layer_count
-        )
-        for i in range(min(n_layers, len(layer_params))):
-            lp = layer_params[i]
-            if isinstance(lp, torch.Tensor):
-                lp = lp.detach().cpu().tolist()
-
-            presence = None
-            if layer_presence is not None and i < len(layer_presence):
-                lpr = layer_presence[i]
-                if isinstance(lpr, torch.Tensor):
-                    lpr = lpr.detach().cpu().tolist()
-                presence = [v > 0.0 for v in lpr]
-
-            geo_idx = None
-            if layer_geos is not None and i < len(layer_geos):
-                lg = layer_geos[i]
-                geo_idx = int(lg.argmax().item() if isinstance(lg, torch.Tensor) else lg)
-
-            layers.append(denormalize_layer(lp, presence, geo_idx))
-
-    params["layers"] = layers
-    return params
-
-
-# ============================================================================
-# Device detection
-# ============================================================================
-
-
-def load_state_dict_compat(sd):
-    """Strip torch.compile _orig_mod. prefix if present."""
-    if not sd or not next(iter(sd)).startswith("_orig_mod."):
-        return sd
-    return {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
 
 
 def get_device():
@@ -904,23 +505,3 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def auto_batch_size(model_vram_mb=200):
-    """Pick batch size based on available VRAM. Conservative estimate."""
-    import torch
-
-    if not torch.cuda.is_available():
-        return 16
-    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    # Reserve ~2GB for model + LPIPS + overhead, rest for batches
-    # ~50MB per sample at 256×256 with activations
-    usable = max(1, vram_gb - 2 - model_vram_mb / 1000)
-    return min(128, max(16, int(usable * 1000 / 50)))
-
-
-def auto_workers():
-    """Pick num_workers for DataLoader based on CPU count."""
-    import os
-    cores = os.cpu_count() or 4
-    return min(cores, 12)

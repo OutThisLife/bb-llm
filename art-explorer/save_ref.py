@@ -11,7 +11,7 @@ DATA_DIR = Path("data/params")
 OUTPUT_DIR = Path("output/params")
 
 
-def _resolve_param_file(sample_id: str):
+def resolve_param_file(sample_id: str):
     """Resolve sample ID to param file path. Returns Path or None."""
     if sample_id.startswith("out:"):
         sample_id, data_dir = sample_id[4:], OUTPUT_DIR
@@ -31,7 +31,7 @@ def _resolve_param_file(sample_id: str):
 
 def save_ref(sample_id: str):
     """Append sample's params to refs.jsonl."""
-    path = _resolve_param_file(sample_id)
+    path = resolve_param_file(sample_id)
     if not path:
         return
 
@@ -90,19 +90,17 @@ def list_refs():
         print("refs.jsonl not found")
         return
     lines = REFS_PATH.read_text().strip().split("\n")
+    ulv = lambda x: x["value"] if isinstance(x, dict) and "disabled" in x else x
     for i, line in enumerate(lines, 1):
         data = json.loads(line)
-        _v = lambda x: x["value"] if isinstance(x, dict) and "disabled" in x else x
-        geo = _v(data.get("Element.geometry", "?"))
-        rep = _v(data.get("Scalars.repetitions", "?"))
-        print(f"{i:3d}. geo={geo}, rep={rep}")
+        print(f"{i:3d}. geo={ulv(data.get('Element.geometry', '?'))}, rep={ulv(data.get('Scalars.repetitions', '?'))}")
 
 
 def open_ref(sample_id: str):
     """Open sample in browser."""
     import webbrowser
 
-    path = _resolve_param_file(sample_id)
+    path = resolve_param_file(sample_id)
     if not path:
         return
     with open(path) as f:

@@ -10,16 +10,12 @@ from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
 
-REFS_PATH = Path("references/refs.jsonl")
+from save_ref import resolve_param_file
+
 CAPTURES_DIR = Path("captures")
 BASE_URL = "http://localhost:3000"
 API_URL = f"{BASE_URL}/api/raster"
-SIZE = 3840  # 4K
-
-
-def load_ref(line: int) -> dict:
-    lines = REFS_PATH.read_text().strip().split("\n")
-    return json.loads(lines[line - 1])
+SIZE = 3840
 
 
 def get_encoded(params: dict) -> str:
@@ -29,28 +25,50 @@ def get_encoded(params: dict) -> str:
     return r.headers["X-Encoded-Params"]
 
 
+BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-setuid-sandbox",
+    "--disable-gpu-sandbox",
+    "--enable-features=WebGL",
+    "--ignore-gpu-blocklist",
+    "--disable-gpu-compositing",
+    "--force-color-profile=srgb",
+]
+
+
 def capture(encoded: str, out_path: Path, size: int = SIZE):
+    dpr = max(1, size / 1024)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": size, "height": size})
-        page.goto(f"{BASE_URL}/render?c={encoded}", wait_until="domcontentloaded")
-        page.wait_for_function("window.__RENDER_READY__ === true", timeout=15000)
-        page.screenshot(path=str(out_path), omit_background=True, type="png")
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+        page = browser.new_page(
+            viewport={"width": 1024, "height": 1024},
+            device_scale_factor=dpr,
+        )
+        page.goto(f"{BASE_URL}/render?dpr={dpr}", wait_until="load", timeout=30000)
+        page.wait_for_function("window.__RENDER_READY__ === true", timeout=60000)
+        page.evaluate("(enc) => window.__updateParams?.(enc)", encoded)
+        page.wait_for_function("window.__RENDER_READY__ === true", timeout=60000)
+        page.screenshot(path=str(out_path), type="png", timeout=120000)
         browser.close()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--line", type=int, default=180, help="Line number in refs.jsonl")
+    ap.add_argument("id", help="Sample ID (328, out:0) — same as save-ref")
     ap.add_argument("--size", type=int, default=SIZE, help="Viewport size (square)")
     ap.add_argument("--out", type=str, default=None, help="Output filename")
     args = ap.parse_args()
 
-    params = load_ref(args.line)
-    encoded = get_encoded(params)
+    path = resolve_param_file(args.id)
+    if not path:
+        return
+    params = json.loads(path.read_text())
 
+    encoded = get_encoded(params)
     CAPTURES_DIR.mkdir(exist_ok=True)
-    out = Path(args.out) if args.out else CAPTURES_DIR / f"ref_{args.line}_{args.size}.png"
+    label = args.id.replace(":", "_")
+    out = Path(args.out) if args.out else CAPTURES_DIR / f"{label}_{args.size}.png"
     capture(encoded, out, args.size)
     print(f"Saved {out} ({args.size}x{args.size})")
 

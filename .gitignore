@@ -5,8 +5,5 @@ unsloth_compiled_cache/
 .venv/
 
 *.pt
-data/
-output/
 *.log
 .ruff_cache/
-art_data/

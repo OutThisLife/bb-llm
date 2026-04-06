@@ -1,12 +1,8 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
-Forward + inverse rendering pipeline. A differentiable forward model (params → image) enables end-to-end training and fast gradient-based optimization (~1ms GPU vs ~50ms HTTP). The renderer is an external service (`http://localhost:3000/api/raster`) that produces ground truth images.
-
-**Forward model is the differentiable proxy. Inverse model maps images back to params. Gradient descent + CMA-ES refines.**
+One VLM (Qwen3-VL-8B QLoRA) learns the full parametric art space of bb-particles. Trained on (image, params) pairs from a renderer API, it predicts complete scene parameters from images, text descriptions, or creative prompts. Optional CMA-ES refinement for pixel-perfect reconstruction.
 
 ## Environment Setup
 
@@ -14,112 +10,120 @@ Forward + inverse rendering pipeline. A differentiable forward model (params →
 conda create -n bb-llm python=3.11 -y
 conda activate bb-llm
 pip install -r requirements.txt
-playwright install chromium
 ```
 
 ## Commands (run from `art-explorer/`)
 
 ```bash
-make generate N=5000   # random/bred data → data/
-make thumb-refs        # cache ref thumbnails → data/refs/images/
-make train             # forward → inverse → taste → inverse finetune
-make discover          # balanced taste + novelty explore
-make loop N=5000       # generate + train + discover
+# Pipeline: generate → caption → train → eval
+make generate N=5000       # random (image, params) pairs → data/
+make caption               # text descriptions (ollama) → data/captions/
+make train                 # SFT on data/
+make eval                  # JSON metrics + parameter coverage
+make eval-render           # + render LPIPS
 
-# Ref curation
-make save-ref ID=328   # add from data/
-make save-ref ID=out:0 # add from output/
-make open-ref ID=328   # open in browser
-make list-refs         # show all refs
-make rm-ref LINE=3     # remove by line number
+# Inference
+make predict TARGET=x.png  # image → params → render
+make predict-refine TARGET=x.png  # + CMA-ES polish
+make text TEXT="spiral..."  # text → params → render
+make discover              # creative generation
 
-make clean             # rm data/ output/ models/
+# Curation
+make judge                 # VLM scoring + keep winners
+make save-ref ID=328
+make list-refs
+
+# RL
+make rl                    # GRPO style mode (auto-harvests winners)
+make round                 # full cycle: rl -> caption -> train -> eval
 ```
 
 ## Linting & Formatting
 
 ```bash
-ruff check .                # lint
-ruff format .               # format
-pyright                     # type check
+ruff check .
+ruff format .
+pyright
 ```
-
-Config in `pyproject.toml`: Python 3.11, line-length 88, double quotes.
 
 ## Architecture
 
 ```
-Forward Model (params → image)     ←── trained on coverage data (refs + random + bred)
-        ↕ differentiable
-Inverse Model (image → params)     ←── Phase 1: full coverage, Phase 2: taste-filtered top 20%
-        ↕
-Taste Model (params → score)       ←── refs (positive) vs random (negative)
-        ↓
-Discover (taste + novelty)         ←── breed → forward model → rank → API render
-        ↓
-Curation (save_ref)                ←── human picks → refs.jsonl → next round
+generate.py -> data/ (image, params pairs)
+caption.py  -> data/captions/ (text descriptions)
+               |
+train.py    -> models/ (QLoRA adapter)
+               |
+eval_sft.py -> JSON metrics + render LPIPS + parameter coverage
+               |
+infer.py    -> image-to-render | text-to-render
+               |
+judge.py    -> VLM generate + ollama scoring -> save-ref
 ```
 
-### Training Lifecycle
+### Iterative RL Loop
 
 ```
-make generate:
-  Generate random + ref-bred data → data/
-
-make thumb-refs:
-  Cache ref thumbnails → data/refs/images/ (content-hashed, skip existing)
-
-make train (4 phases):
-  1. Forward model on all data (L1 + LPIPS)
-  2. Inverse model on all data (param-space + perceptual loss)
-  3. Taste model: refs vs random data
-  4. Fine-tune inverse on taste-filtered top 20% (lower LR)
+SFT (train.py) -> eval -> RL (rl.py, composite reward, auto-harvests)
+      ^                          |
+      +-- caption new samples <--+
 ```
 
-All models train on `data/`. Ref influence comes through breeding (30% of generated samples inherit from refs). Taste model scores data to focus inverse fine-tuning on the interesting region.
+`make round` runs one full cycle: rl -> caption -> train -> eval.
 
-### Pipeline Stages
+### Key Files
 
-1. **generate.py** - Creates (image, params) training pairs via renderer API. Random + ref-bred samples (30% breeding rate).
+- **generate.py** - Stratified random (image, params) pairs via renderer API.
+- **caption.py** - Text descriptions for text-to-render training (Gemma 3 4B via Ollama).
+- **train.py** - QLoRA fine-tune. Supports text+image inputs. Filters degenerate renders.
+- **eval_sft.py** - Render-based eval: parse rate, key overlap, LPIPS, parameter coverage.
+- **infer.py** - `--target` (image->render), `--text` (text->render). Optional `--refine` for CMA-ES.
+- **scoring.py** - Shared ollama judge scoring (used by judge.py and rl.py).
+- **judge.py** - VLM generate -> render -> ollama scores vs refs -> keep winners.
+- **rl.py** - GRPO RL with composite reward. Zero-std skip. Auto-harvests winners to data/.
+- **harvest.py** - Manual retroactive harvest at different thresholds.
+- **utils.py** - Schema, random generation, format converters.
 
-2. **model.py** - Three models:
-   - **ForwardModel**: params → 3×256×256 image. Self-attention decoder. ~11M params.
-   - **InverseModel**: image → params. DINOv2-S/14 backbone with multi-head MLP outputs.
-   - **TasteModel**: param features → preference logit. Lightweight MLP.
+### Composite RL Reward
 
-3. **train.py** - Four-phase training:
-   - Phase 1: Forward model (L1 + LPIPS perceptual loss)
-   - Phase 2: Inverse model full coverage (param-space + perceptual loss through frozen forward)
-   - Phase 3: Taste model (refs vs random, BCE loss)
-   - Phase 4: Inverse fine-tune on taste-filtered top 20% (lower LR)
+`rl.py` uses multi-signal scoring per mode:
 
-4. **predict.py** - Inverse prediction + explore:
-   - Inverse: CNN predict → CMA-ES → gradient descent → CMA-ES polish → API render
-   - Explore: breed from refs → taste + novelty scoring → top N rendered
+| Mode | lpips_ref | lpips_target | aesthetic |
+|------|-----------|-------------|-----------|
+| style | 1.0 (0.8 w/ judge) | 0.0 | 0.0 (0.2 w/ judge) |
+| inverse | 0.0 | 1.0 | 0.0 |
+| explore | 1.0 (0.3 w/ judge) | 0.0 | 0.0 (0.7 w/ judge) |
+
+GRPO stability: zero-std groups are detected and skipped. Logged in `rewards.csv`.
 
 ### Two Parameter Formats
 
 | Context | Format | Example |
 |---------|--------|---------|
-| refs.jsonl / breeding | Leva-prefixed | `"Scalars.repetitions"`, `"Scene.position"` |
-| API / CNN / models | Flat (SceneParams) | `"repetitions"`, `"position"` |
+| Renderer API / Leva | Prefixed | `"Scalars.repetitions"` |
+| VLM / flat JSON | SceneParams | `"repetitions"` |
 
-Converters in `utils.py`: `to_scene_params()` (prefixed → flat) and `to_prefixed()` (flat → prefixed). Models use flat format internally; convert only at boundaries. Dither params are flat in model format (`ditherEnabled`, `ditherStrength`, etc.) but nested in API SceneParams (`dither: {enabled, ...}`). Generation sends prefixed format to API (bypasses nesting); predict uses `to_prefixed()` to convert flat→prefixed before API calls.
-
-### Key Files
-
-- **utils.py** - Single source of truth: `SCHEMA`, `LAYER_SCHEMA`, derived constants (`CONTINUOUS_KEYS`, `CATEGORICAL_KEYS`, etc.), param encoding/decoding (`encode_params`/`decode_params`), normalization helpers, format converters.
-- **model.py** - ForwardModel (attention-based decoder) + InverseModel (DINOv2-S backbone).
-- **references/refs.jsonl** - Curated parameter sets that seed future data generation.
-- **output/** - Results from predict/explore. Curate with `make save-ref ID=out:N`.
+Converters in `utils.py`: `to_scene_params()` and `to_prefixed()`.
 
 ### External Dependencies
 
-- Renderer API must be running at `localhost:3000` for data generation and prediction.
-- DINOv2-S/14 pretrained weights via `timm` for the inverse model backbone.
-- CLIP-ViT-B/16 via `transformers` (optional, for `--clip` novelty scoring).
-- `lpips` AlexNet for perceptual loss (forward + inverse training, gradient/CMA-ES scoring).
+- Renderer API at `localhost:3000` (bb-particles).
+- Ollama at `localhost:11434` (gemma3:4b for captions, gemma3:27b for judge scoring).
+- `lpips` AlexNet for CMA-ES refinement.
 
-## training-tests/
+## GPU Safety (4090)
 
-Separate experimental directory for from-scratch GPT training (MiniGPT with BPE tokenizer). Not part of the main rendering pipeline.
+- Per-sample backward in GRPO (no batch accumulation that could OOM)
+- LPIPS on CPU (avoids stacking AlexNet on same GPU as 7B VLM)
+- Explicit `torch.cuda.synchronize()` after optimizer step
+- 4-bit NF4 quantization for base model
+
+## Failure Triage
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| All render fails | Renderer down | Start bb-particles `pnpm dev` |
+| All judge scores 0 | Ollama down | `ollama serve` + pull model |
+| Zero-std collapse | Uniform rewards | Check refs exist, try different mode |
+| Illegal memory access | GPU OOM | Reduce `--group`, check no other GPU users |
+| Harvest finds nothing | Threshold too high | Lower `--threshold` (default -0.3) |

@@ -1,35 +1,44 @@
-# Art Explorer Makefile
-
 P := python
 N ?= 5000
+THRESHOLD ?= -0.3
 
-# Core workflow
+# ── Data ─────────────────────────────────────────────────
+
 generate:
 	$(P) generate.py -n $(N)
 
-generate-figma:
-	$(P) generate.py -n $(N) --hard-figma
+DATA ?= data
+
+caption:
+	$(P) caption.py --data $(DATA) --workers 4
 
 train:
 	$(P) train.py --data data
 
-discover:
-	$(P) predict.py --explore -n 500
+eval:
+	$(P) eval_sft.py --data data -n 50
+
+eval-render:
+	$(P) eval_sft.py --data data --render -n 50
+
+# ── Inference ─────────────────────────────────────────────
+
+predict:
+	$(P) infer.py --target $(TARGET)
+
+predict-refine:
+	$(P) infer.py --target $(TARGET) --refine
+
+text:
+	$(P) infer.py --text "$(TEXT)"
+
+# ── Curation ──────────────────────────────────────────────
 
 judge:
-	$(P) judge.py -n 10 --threshold 9
+	$(P) judge.py -n 10 --threshold 80
 
-loop:
-	$(P) generate.py -n $(N)
-	$(P) train.py --data data
-	$(P) predict.py --explore -n 20
-
-# Ref curation
 save-ref:
 	$(P) save_ref.py add $(ID)
-
-open-ref:
-	$(P) save_ref.py open $(ID)
 
 rm-ref:
 	$(P) save_ref.py rm $(LINE)
@@ -37,32 +46,55 @@ rm-ref:
 list-refs:
 	$(P) save_ref.py list
 
-capture:
-	$(P) capture.py --line $(LINE)
-
 thumb-refs:
 	$(P) thumb_refs.py
 
-# Utilities
+capture:
+	$(P) capture.py $(ID)
+
+# ── RL ────────────────────────────────────────────────────
+
+rl:
+	$(P) rl.py
+
+# rl (auto-harvests) -> caption -> train -> eval
+round:
+	$(MAKE) rl
+	$(MAKE) caption
+	$(MAKE) train
+	$(MAKE) eval
+
+# ── Dashboard ─────────────────────────────────────
+
+dash:
+	$(P) -m uvicorn serve:app --reload --port 8000
+
+# ── Misc ──────────────────────────────────────────────────
+
 clean:
-	rm -rf data/ output/ models/
+	rm -rf data/images data/params output/ models/
 
 help:
-	@echo "Art Explorer"
+	@echo "  make caption               caption uncaptioned images"
+	@echo "  make train                 SFT on data/"
+	@echo "  make round                 full cycle: rl -> caption -> train -> eval"
+	@echo "  make rl                    GRPO (add JUDGE=1 for aesthetic scoring)"
+	@echo "  make eval                  metrics + coverage"
 	@echo ""
-	@echo "  make generate N=5000   # coverage data"
-	@echo "  make train             # forward + inverse + taste + param prior"
-	@echo "  make discover -n 500    # sample from prior + taste rerank"
-	@echo "  make judge             # VLM-guided reject loop (ollama)"
-	@echo "  make loop N=5000       # generate + train + discover"
+	@echo "  make predict TARGET=x.png  image -> params -> render"
+	@echo "  make text TEXT='spiral...' text -> params -> render"
+	@echo "  make judge                 VLM discovery + scoring"
 	@echo ""
-	@echo "Curation:"
-	@echo "  make save-ref ID=328"
-	@echo "  make save-ref ID=out:0"
-	@echo "  make open-ref ID=328"
-	@echo "  make list-refs"
-	@echo "  make rm-ref LINE=3"
-	@echo "  make thumb-refs"
+	@echo "  make save-ref ID=328       add to refs"
+	@echo "  make rm-ref LINE=3         remove ref"
+	@echo "  make list-refs             list refs"
+	@echo "  make capture ID=328        hi-res capture"
+	@echo ""
+	@echo "  make generate N=5000       new base data (if needed)"
+	@echo ""
+	@echo "  make dash                  dashboard API (port 8000; run: pip install -r requirements.txt)"
 
-.PHONY: generate generate-figma train discover judge loop \
-        save-ref open-ref rm-ref list-refs capture thumb-refs clean help
+.PHONY: generate caption train eval eval-render \
+        predict predict-refine text \
+        judge save-ref rm-ref list-refs thumb-refs capture \
+        rl round clean help dash
