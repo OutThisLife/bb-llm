@@ -10,6 +10,7 @@ import os
 import random
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -24,11 +25,16 @@ from utils import random_params, to_scene_params
 
 DATA_DIR = Path("data")
 API_URL = "http://localhost:3000/api/raster"
-MAX_WORKERS = min(os.cpu_count() or 4, 4)
+HEALTH_URL = "http://localhost:3000/api/raster?health"
+MAX_WORKERS = 2
+FAIL_BACKOFF_THRESHOLD = 5
+FAIL_BACKOFF_MAX = 120
 
 _pbar_lock = threading.Lock()
 _pbar = None
 _session_local = threading.local()
+_consecutive_fails = 0
+_fail_lock = threading.Lock()
 
 
 def _get_session():
@@ -39,14 +45,61 @@ def _get_session():
     return _session_local.session
 
 
+def _wait_for_healthy():
+    global _consecutive_fails
+
+    print(f"\n⚠ {_consecutive_fails} fails, waiting for renderer…")
+
+    for attempt in range(30):
+        time.sleep(min(5 * (attempt + 1), 30))
+        try:
+            r = requests.get(HEALTH_URL, timeout=5)
+            data = r.json() if r.ok else {}
+            if data.get("ok") and not data.get("recycling"):
+                with _fail_lock:
+                    _consecutive_fails = 0
+                print(f"  renderer healthy after {(attempt+1)*5}s")
+                return
+        except Exception:
+            pass
+
+    print("⚠ renderer still unhealthy, continuing…")
+
+
 def generate_one(i, prefixed):
+    global _consecutive_fails
     flat = to_scene_params(prefixed)
-    try:
-        resp = _get_session().post(API_URL, json=prefixed, timeout=60)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"\nSkipping {i:06d}: {e}")
+
+    with _fail_lock:
+        if _consecutive_fails >= FAIL_BACKOFF_THRESHOLD:
+            _wait_for_healthy()
+
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = _get_session().post(API_URL, json=prefixed, timeout=60)
+            if resp.status_code == 503:
+                time.sleep(10 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            resp = None
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            with _fail_lock:
+                _consecutive_fails += 1
+            print(f"\nSkipping {i:06d}: {e}")
+            return
+
+    if resp is None or resp.status_code != 200:
+        with _fail_lock:
+            _consecutive_fails += 1
         return
+
+    with _fail_lock:
+        _consecutive_fails = 0
 
     img_path = DATA_DIR / f"images/{i:06d}.png"
     img_path.write_bytes(resp.content)

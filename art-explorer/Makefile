@@ -57,7 +57,14 @@ capture:
 rl:
 	$(P) rl.py
 
-# rl (auto-harvests) -> caption -> train -> eval
+# cold start: generate -> caption -> train -> eval
+bootstrap:
+	$(MAKE) generate
+	$(MAKE) caption
+	$(MAKE) train
+	$(MAKE) eval
+
+# iterative: rl (auto-harvests) -> caption -> train -> eval
 round:
 	$(MAKE) rl
 	$(MAKE) caption
@@ -97,4 +104,4 @@ help:
 .PHONY: generate caption train eval eval-render \
         predict predict-refine text \
         judge save-ref rm-ref list-refs thumb-refs capture \
-        rl round clean help dash
+        rl bootstrap round clean help dash
