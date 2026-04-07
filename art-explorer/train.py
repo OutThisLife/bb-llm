@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from cli import cli
+
 import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -296,6 +298,7 @@ def train(
     print(f"Saved adapter to {output_dir}")
 
 
+@cli
 def main():
     p = argparse.ArgumentParser(description="Fine-tune VLM on full param space")
     p.add_argument("--data", type=Path, default=Path("data"))

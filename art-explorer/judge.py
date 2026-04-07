@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from cli import cli
 from infer import render_api, load_vlm, vlm_generate, parse_params, fill_defaults
 from infer import DEFAULT_ENDPOINT, OUTPUT_DIR, SYSTEM_PROMPT, DISCOVER_PROMPTS
 from scoring import ollama_score, score_bar, OLLAMA, JUDGE_MODEL
@@ -27,17 +28,18 @@ def load_refs(n=4):
     return [Image.open(p).convert("RGB") for p in random.sample(paths, min(n, len(paths)))]
 
 
+@cli
 def main():
-    pa = argparse.ArgumentParser()
-    pa.add_argument("-n", "--keep", type=int, default=10)
-    pa.add_argument("-w", "--workers", type=int, default=6)
-    pa.add_argument("--threshold", type=float, default=80)
-    pa.add_argument("--judge-model", default=JUDGE_MODEL)
-    pa.add_argument("--adapter", default="models")
-    pa.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
-    pa.add_argument("--ollama", default=OLLAMA)
-    pa.add_argument("--auto-ref", action="store_true")
-    args = pa.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("-n", "--keep", type=int, default=10)
+    p.add_argument("-w", "--workers", type=int, default=6)
+    p.add_argument("--threshold", type=float, default=80)
+    p.add_argument("--judge-model", default=JUDGE_MODEL)
+    p.add_argument("--adapter", default="models")
+    p.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    p.add_argument("--ollama", default=OLLAMA)
+    p.add_argument("--auto-ref", action="store_true")
+    args = p.parse_args()
 
     refs = load_refs()
     if not refs:

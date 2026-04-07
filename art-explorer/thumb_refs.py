@@ -7,6 +7,7 @@ from pathlib import Path
 
 import requests
 
+from cli import cli
 from utils import to_scene_params
 
 REFS_PATH = Path("references/refs.jsonl")
@@ -14,12 +15,13 @@ IMG_DIR = Path("data/refs/images")
 PARAM_DIR = Path("data/refs/params")
 
 
+@cli
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://localhost:3000")
-    ap.add_argument("--size", type=int, default=256)
-    ap.add_argument("--force", action="store_true")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--base-url", default="http://localhost:3000")
+    p.add_argument("--size", type=int, default=256)
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args()
 
     if not REFS_PATH.exists():
         print("No refs found")

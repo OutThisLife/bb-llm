@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from cli import cli
 from utils import to_prefixed
 
 REFS_PATH = Path("references/refs.jsonl")
@@ -113,7 +114,8 @@ def open_ref(sample_id: str):
     print(f"Opened {path.stem}")
 
 
-if __name__ == "__main__":
+@cli
+def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd")
 
@@ -123,13 +125,10 @@ if __name__ == "__main__":
     sub.add_parser("list", help="List refs")
 
     args = p.parse_args()
-    if args.cmd == "add":
-        save_ref(args.id)
-    elif args.cmd == "rm":
-        rm_ref(args.line)
-    elif args.cmd == "open":
-        open_ref(args.id)
-    elif args.cmd == "list":
-        list_refs()
-    else:
-        p.print_help()
+    cmds = {"add": lambda: save_ref(args.id), "rm": lambda: rm_ref(args.line),
+            "open": lambda: open_ref(args.id), "list": list_refs}
+    cmds.get(args.cmd, p.print_help)()
+
+
+if __name__ == "__main__":
+    main()

@@ -6,6 +6,8 @@ import json
 import shutil
 from pathlib import Path
 
+from cli import cli
+
 DATA_DIR = Path("data")
 RL_DIR = Path("rl_runs")
 
@@ -94,10 +96,15 @@ def harvest(threshold=-0.3, dry_run=False, source=None):
         print(f"  harvested {added} → data/ (total: {next_id})")
 
 
-if __name__ == "__main__":
+@cli
+def main():
     p = argparse.ArgumentParser(description="Harvest RL winners into SFT data pool")
     p.add_argument("--threshold", type=float, default=-0.3, help="Min reward")
     p.add_argument("--run", type=Path, default=None, help="Specific run dir")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
     harvest(threshold=args.threshold, dry_run=args.dry_run, source=args.run)
+
+
+if __name__ == "__main__":
+    main()

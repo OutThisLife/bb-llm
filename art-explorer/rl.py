@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from cli import cli
 from infer import (
     DEFAULT_ENDPOINT, DISCOVER_PROMPTS, SYSTEM_PROMPT,
     fill_defaults, load_vlm, parse_params, render_api, to_lpips_tensor, vlm_generate,
@@ -395,6 +396,7 @@ def train(
     print(f"  auto-harvested winners from {run.name}")
 
 
+@cli
 def main():
     p = argparse.ArgumentParser(description="GRPO RL with composite render-in-loop reward")
     p.add_argument("--mode", choices=["style", "inverse", "explore"], default="style")

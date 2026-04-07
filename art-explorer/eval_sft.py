@@ -15,6 +15,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
+from cli import cli
 from infer import (
     DEFAULT_ENDPOINT,
     SYSTEM_PROMPT,
@@ -191,6 +192,7 @@ def evaluate(
         coverage_report(all_predictions)
 
 
+@cli
 def main():
     p = argparse.ArgumentParser(description="Evaluate fine-tuned VLM on held-out data")
     p.add_argument("--data", type=Path, default=Path("data"))

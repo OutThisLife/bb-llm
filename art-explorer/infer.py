@@ -2,7 +2,6 @@
 Predict: VLM-powered scene parameter prediction.
   --target image.png   Image → params → render
   --text "..."         Text → params → render
-  --discover           Creative generation
   --refine             + CMA-ES polish (image mode only)
 """
 
@@ -22,6 +21,7 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from cli import cli
 from utils import (
     BOOLEAN_KEYS, CATEGORICAL_KEYS, CONTINUOUS_KEYS,
     LAYER_CONTINUOUS_KEYS, LAYER_OPTIONALS, MAX_LAYERS,
@@ -293,6 +293,7 @@ def text_to_render(text, adapter, endpoint):
     _save(params, rendered, text[:40].replace(" ", "_").replace("/", "_"))
 
 
+@cli
 def main():
     p = argparse.ArgumentParser(description="VLM-powered scene parameter prediction")
     p.add_argument("--target", help="Image-to-render")

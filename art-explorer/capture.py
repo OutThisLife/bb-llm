@@ -10,6 +10,7 @@ from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
 
+from cli import cli
 from save_ref import resolve_param_file
 
 CAPTURES_DIR = Path("captures")
@@ -53,12 +54,13 @@ def capture(encoded: str, out_path: Path, size: int = SIZE):
         browser.close()
 
 
+@cli
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("id", help="Sample ID (328, out:0) — same as save-ref")
-    ap.add_argument("--size", type=int, default=SIZE, help="Viewport size (square)")
-    ap.add_argument("--out", type=str, default=None, help="Output filename")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("id", help="Sample ID (328, out:0) — same as save-ref")
+    p.add_argument("--size", type=int, default=SIZE, help="Viewport size (square)")
+    p.add_argument("--out", type=str, default=None, help="Output filename")
+    args = p.parse_args()
 
     path = resolve_param_file(args.id)
     if not path:

@@ -17,6 +17,8 @@ import requests
 from PIL import Image
 from tqdm import tqdm
 
+from cli import cli
+
 OLLAMA = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5vl"
 
@@ -234,7 +236,8 @@ def caption(data_dir="data", n=None, workers=4, backend="ollama", model=None):
     print(f"Done: {total}/{len(images)} captioned ({errors} errors)")
 
 
-if __name__ == "__main__":
+@cli
+def main():
     p = argparse.ArgumentParser(description="Generate captions for rendered images")
     p.add_argument("--data", default="data")
     p.add_argument("-n", type=int, default=None, help="Max images to caption")
@@ -243,3 +246,7 @@ if __name__ == "__main__":
     p.add_argument("--model", default=None, help="Override model name")
     args = p.parse_args()
     caption(data_dir=args.data, n=args.n, workers=args.workers, backend=args.backend, model=args.model)
+
+
+if __name__ == "__main__":
+    main()

@@ -17,11 +17,12 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
+from cli import cli
 from utils import random_params, to_scene_params
 
 DATA = Path("data")
 API = "http://localhost:3000/api/raster"
-WORKERS = 2
+WORKERS = 8
 FAIL_THRESHOLD = 5
 
 _pbar_lock = threading.Lock()
@@ -123,24 +124,32 @@ def generate(n=2000, workers=WORKERS):
     params = [random_params(stratified=True) for _ in range(n)]
     random.shuffle(params)
 
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = [ex.submit(generate_one, start + i, p) for i, p in enumerate(params)]
+
     with tqdm(total=n, desc="Rendering", unit="img") as pbar:
         _pbar = pbar
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(generate_one, start + i, p) for i, p in enumerate(params)]
-            for f in futs:
-                f.result()
+        for f in futs:
+            f.result()
         _pbar = None
 
+    ex.shutdown(wait=False)
     print(f"Done: {n} samples in {DATA}/")
 
 
-if __name__ == "__main__":
+@cli
+def main():
     p = argparse.ArgumentParser()
     p.add_argument("-n", type=int, default=2000)
+    p.add_argument("--workers", type=int, default=WORKERS)
     p.add_argument("--clean", action="store_true")
     args = p.parse_args()
 
     if args.clean and DATA.exists():
         shutil.rmtree(DATA)
 
-    generate(n=args.n)
+    generate(n=args.n, workers=args.workers)
+
+
+if __name__ == "__main__":
+    main()
