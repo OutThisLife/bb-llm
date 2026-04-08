@@ -28,10 +28,11 @@ You're a user typing a short request into a generative art tool. Look at this im
 Rules:
 - 3-12 words max
 - No "I want" or "make me" — just describe the thing
-- Mix of specific ("tight spiral rings from center") and vague ("something organic and layered") is fine
-- Sometimes just a vibe: "op-art", "zen", "chaotic grid"
+- Focus on what makes THIS image unique: shape, motion, color, density, symmetry, texture
+- Describe the visual, not the technique
+- Be specific — every image should get a different caption
 
-Write TWO options on separate lines — one specific, one more abstract/casual.
+Write TWO options on separate lines — one describing the visual precisely, one capturing the mood/feel.
 No labels, no preamble, just the two lines."""
 
 
@@ -87,6 +88,36 @@ def structured_caption(params: dict) -> str:
     if alpha:
         parts.append(f"{alpha} alpha")
 
+    # Factor magnitudes — these dramatically affect the visual result
+    sf = params.get("scaleFactor", 1.0)
+    if sf < 0.3:
+        parts.append("rapid shrink")
+    elif sf > 1.5:
+        parts.append("growing")
+
+    rf = params.get("rotationFactor", 0.0)
+    if abs(rf) > 0.5:
+        parts.append("strong twist" if rf > 0 else "reverse twist")
+
+    af = params.get("alphaFactor", 1.0)
+    if af < 0.3:
+        parts.append("fast fade")
+
+    stf = params.get("stepFactor", 1.0)
+    if stf > 1.5:
+        parts.append("accelerating steps")
+    elif stf < 0.1:
+        parts.append("tight steps")
+
+    # Position offsets
+    xs, ys = abs(params.get("xStep", 0)), abs(params.get("yStep", 0))
+    if xs > 0.5 or ys > 0.5:
+        parts.append("spread" if xs > 0.5 and ys > 0.5 else "horizontal spread" if xs > 0.5 else "vertical spread")
+
+    pp = params.get("positionProgression", "")
+    if pp and pp != "index":
+        parts.append(f"{pp} positioning")
+
     w = params.get("geoWidth", 0.041)
     if w < 0.01:
         parts.append("thin strokes")
@@ -117,7 +148,7 @@ def _call_ollama(img_path, prompt, model=DEFAULT_MODEL, endpoint=OLLAMA):
             "model": model,
             "messages": [{"role": "user", "content": prompt, "images": [_img_b64(img_path)]}],
             "stream": False,
-            "options": {"temperature": 0.7, "num_predict": 40},
+            "options": {"temperature": 0.7, "num_predict": 30},
         },
         timeout=120,
     )
@@ -141,7 +172,7 @@ def _call_openrouter(img_path, prompt, model="google/gemini-2.0-flash-001"):
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_img_b64(img_path)}"}},
                 ],
             }],
-            "max_tokens": 40,
+            "max_tokens": 30,
             "temperature": 0.7,
         },
         timeout=60,
@@ -150,18 +181,44 @@ def _call_openrouter(img_path, prompt, model="google/gemini-2.0-flash-001"):
     return resp.json()["choices"][0]["message"]["content"]
 
 
+def _fix_caption(text, max_words=12):
+    """Clean up VLM caption artifacts and enforce word limit."""
+    import re
+    # Fix jammed words like "contrastAbstract" -> "contrast abstract"
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    # Strip stray prefix fragments: a single lowercase word before a capitalized restart
+    # catches "aesthetic White..." -> "White...", "Sw Circular..." -> "Circular...", "sym\"Golden..." -> "Golden..."
+    text = re.sub(r'^[a-z]+["\s]+(?=[A-Z])', '', text)
+    # Strip leading punctuation/quotes/commas
+    text = text.lstrip('.,;:"\'\`')
+    # Strip imperative openers directed at the tool
+    text = re.sub(r'^(Create|Design|Make|Generate|Draw|Produce|Build)\s+(an?\s+)?', '', text, flags=re.IGNORECASE)
+    # Enforce word limit
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    # Strip trailing fragment words (articles, prepositions, conjunctions)
+    trail = {"a", "an", "the", "and", "or", "but", "in", "on", "of", "with", "for", "to", "from", "by", "as", "at", "its", "their", "this", "that"}
+    words = text.split()
+    while words and words[-1].lower().rstrip(".,;:") in trail:
+        words.pop()
+    text = " ".join(words).rstrip(".,;:")
+    return text
+
+
 def _parse_two_lines(raw: str):
-    lines = [_clean(l) for l in raw.strip().splitlines() if l.strip() and not l.strip().startswith(("#", "-", "*", "1", "2"))]
+    lines = [_clean(l) for l in raw.strip().splitlines() if l.strip() and not l.strip().startswith(("#", "-", "*"))]
     # strip leading numbering like "1." or "1)"
     cleaned = []
     for l in lines:
         for prefix in ["1.", "2.", "1)", "2)"]:
             if l.startswith(prefix):
                 l = l[len(prefix):].strip()
+                break
         cleaned.append(l)
     lines = [l for l in cleaned if l]
-    prompt = lines[0] if lines else ""
-    brief = lines[1] if len(lines) > 1 else prompt
+    prompt = _fix_caption(lines[0]) if lines else ""
+    brief = _fix_caption(lines[1]) if len(lines) > 1 else prompt
     return prompt, brief
 
 
@@ -214,6 +271,12 @@ def caption(data_dir="data", n=None, workers=4, backend="ollama", model=None):
             # VLM: prompt + brief
             raw = fn(img_path, PROMPT_INSTRUCTION, **fn_kwargs)
             prompt, brief = _parse_two_lines(raw)
+
+            # Fall back to structured if VLM returned empty
+            if not prompt:
+                prompt = struct
+            if not brief:
+                brief = struct
 
             return {"id": img_path.stem, "structured": struct, "prompt": prompt, "brief": brief}
         except Exception as e:
