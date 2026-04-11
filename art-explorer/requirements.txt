@@ -1,2 +1,0 @@
-# API + inference stack (same as parent bb-llm; install once in the venv you use for `make dash`)
--r ../requirements.txt

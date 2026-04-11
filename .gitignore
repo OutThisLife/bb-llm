@@ -8,3 +8,7 @@ node_modules/
 *.pt
 *.log
 .ruff_cache/
+rl_runs/
+data/
+models/
+output/

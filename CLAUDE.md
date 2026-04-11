@@ -12,30 +12,30 @@ conda activate bb-llm
 pip install -r requirements.txt
 ```
 
-## Commands (run from `art-explorer/`)
+## Commands (run from repo root)
 
 ```bash
 # Pipeline: generate → caption → train → eval
-make generate N=5000       # random (image, params) pairs → data/
-make caption               # text descriptions (ollama) → data/captions/
-make train                 # SFT on data/
-make eval                  # JSON metrics + parameter coverage
-make eval-render           # + render LPIPS
+just generate N=5000       # random (image, params) pairs → data/
+just caption               # text descriptions (ollama) → data/captions/
+just train                 # SFT on data/
+just eval                  # JSON metrics + parameter coverage
+just eval-render           # + render LPIPS
 
 # Inference
-make predict TARGET=x.png  # image → params → render
-make predict-refine TARGET=x.png  # + CMA-ES polish
-make text TEXT="spiral..."  # text → params → render
-make discover              # creative generation
+just predict TARGET=x.png  # image → params → render
+just predict-refine TARGET=x.png  # + CMA-ES polish
+just text TEXT="spiral..."  # text → params → render
+just discover              # creative generation
 
 # Curation
-make judge                 # VLM scoring + keep winners
-make save-ref ID=328
-make list-refs
+just judge                 # VLM scoring + keep winners
+just save-ref ID=328
+just list-refs
 
 # RL
-make rl                    # GRPO style mode (auto-harvests winners)
-make round                 # full cycle: rl -> caption -> train -> eval
+just rl                    # GRPO style mode (auto-harvests winners)
+just round                 # full cycle: rl -> caption -> train -> eval
 ```
 
 ## Linting & Formatting
@@ -69,7 +69,7 @@ SFT (train.py) -> eval -> RL (rl.py, composite reward, auto-harvests)
       +-- caption new samples <--+
 ```
 
-`make round` runs one full cycle: rl -> caption -> train -> eval.
+`just round` runs one full cycle: rl -> caption -> train -> eval.
 
 ### Key Files
 

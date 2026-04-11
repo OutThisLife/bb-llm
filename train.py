@@ -116,7 +116,11 @@ def _collect_samples(data_dir: Path):
     captions = _load_captions(data_dir)
     skipped = 0
     samples = []
-    for img_path in _iter_images(img_dir):
+    imgs = _iter_images(img_dir)
+    for i, img_path in enumerate(imgs):
+        if i % 500 == 0:
+            print(f"\r  scanning {i}/{len(imgs)}...", end="", flush=True)
+
         param_path = param_dir / f"{img_path.stem}.json"
         if not param_path.exists():
             continue
@@ -135,6 +139,7 @@ def _collect_samples(data_dir: Path):
             if text:
                 samples.append({"image_path": "", "caption": text, "target": target})
 
+    print()
     return samples, skipped
 
 
@@ -189,7 +194,7 @@ def _find_token_sequence(seq, pattern):
 def train(
     data_dir: Path,
     output_dir: Path,
-    epochs: int = 3,
+    epochs: int = 2,
     lr: float = 2e-4,
     batch_size: int = 1,
     grad_accum: int = 16,
@@ -255,7 +260,7 @@ def train(
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="adamw_bnb_8bit",
-        torch_empty_cache_steps=4,
+        torch_empty_cache_steps=100,
     )
 
     response_marker = processor.tokenizer.encode(
@@ -288,10 +293,15 @@ def train(
         batch["labels"] = labels
         return batch
 
+    ckpts = sorted(output_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1]))
+    resume = str(ckpts[-1]) if ckpts else None
+    if resume:
+        print(f"Resuming from {resume}")
+
     Trainer(
         model=model, args=training_args,
         train_dataset=train_data, eval_dataset=val_data, data_collator=collate_fn,
-    ).train()
+    ).train(resume_from_checkpoint=resume)
 
     model.save_pretrained(str(output_dir))
     processor.save_pretrained(str(output_dir))
